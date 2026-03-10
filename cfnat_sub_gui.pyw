@@ -25,12 +25,25 @@ CFNAT_BIN = "cfnat-windows7-amd64.exe"
 NODES_FILE = "nodes.txt"
 SUBSCRIPTION_FILE = "subscription.txt"
 LOCATION_CACHE_FILE = "location_cache.json"
+LOCATION_STATS_FILE = "location_stats.json"
 DEFAULT_PORT = 8888
 MAX_NODES = 20
 SUB_PATH = "/sub"
 LOCATION_DATA = None
 LOCATION_CACHE = {}
 PID_FILE = "cfnat_sub.pid"
+
+DEFAULT_CONFIG = {
+    'colo': 'HKG',
+    'delay': 200,
+    'delay_rush': 300,
+    'task': 100,
+    'num': 3,
+    'ipnum': 50,
+}
+
+last_location_stats = {}
+current_args = None
 
 captured_ips = []
 captured_data = []
@@ -253,6 +266,59 @@ def save_location_cache():
             json.dump(LOCATION_CACHE, f, ensure_ascii=False, indent=2)
     except:
         pass
+
+
+def load_location_stats():
+    global last_location_stats
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    stats_path = os.path.join(script_dir, LOCATION_STATS_FILE)
+    if os.path.exists(stats_path):
+        try:
+            with open(stats_path, 'r', encoding='utf-8') as f:
+                last_location_stats = json.load(f)
+        except:
+            last_location_stats = {}
+
+
+def save_location_stats(stats_data):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    stats_path = os.path.join(script_dir, LOCATION_STATS_FILE)
+    try:
+        save_data = {
+            'timestamp': datetime.now().isoformat(),
+            'stats': stats_data
+        }
+        with open(stats_path, 'w', encoding='utf-8') as f:
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
+
+def get_best_colos_from_stats():
+    if not last_location_stats or 'stats' not in last_location_stats:
+        return []
+    stats = last_location_stats['stats']
+    colos = []
+    for loc, data in stats.items():
+        if data.get('count', 0) >= 10:
+            avg_delay = (data.get('min_delay', 9999) + data.get('max_delay', 0)) // 2
+            code = get_location_code(loc)
+            colos.append({
+                'name': loc,
+                'code': code,
+                'count': data['count'],
+                'avg_delay': avg_delay
+            })
+    
+    colos.sort(key=lambda x: (x['avg_delay'], -x['count']))
+    
+    return colos
+
+
+def is_rush_hour():
+    now = datetime.now()
+    hour = now.hour
+    return 18 <= hour <= 22
 
 
 def get_location_code(city_name):
@@ -584,6 +650,7 @@ def cfnat_worker(args):
                     gui_print(f"[优选模式] 扫描完成，进入IP优选阶段")
                     gui_print(f"{'='*60}")
                     if location_stats:
+                        save_location_stats(location_stats)
                         gui_print(f"")
                         gui_print(f"[扫描统计] 各机场 IP 分布 (≥10个):")
                         gui_print(f"{'-'*60}")
@@ -735,63 +802,79 @@ class CfnatGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("cfnat 本地订阅生成器")
-        self.root.geometry("700x500")
+        self.root.geometry("750x600")
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
-        self.bat_configs = {}
+        load_location_stats()
         self.create_widgets()
+        self.update_defaults()
         
     def create_widgets(self):
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        bat_files = find_bat_files()
         
-        if bat_files:
-            config_frame = ttk.Frame(self.root, padding="5")
-            config_frame.pack(fill=tk.X)
-            
-            ttk.Label(config_frame, text="配置:").pack(side=tk.LEFT)
-            
-            def get_sort_key(bat):
-                config = parse_bat_config(os.path.join(script_dir, bat))
-                is_preferred = config['colo'] == 'HKG' and config['num'] == 3 and config['delay'] == 200
-                return (0 if is_preferred else 1, bat)
-            
-            bat_files = sorted(bat_files, key=get_sort_key)
-            
-            display_names = []
-            for bat in bat_files:
-                config = parse_bat_config(os.path.join(script_dir, bat))
-                display_name = f"{bat} (机房:{config['colo']} 延迟:{config['delay']}ms)"
-                display_names.append(display_name)
-                self.bat_configs[display_name] = config
-            
-            display_names.append("自定义配置")
-            
-            self.bat_combo = ttk.Combobox(config_frame, values=display_names, width=45, state='readonly')
-            self.bat_combo.current(0)
-            self.bat_combo.pack(side=tk.LEFT, padx=2)
-            self.bat_combo.bind('<<ComboboxSelected>>', self.on_bat_selected)
+        info_frame = ttk.LabelFrame(self.root, text="智能配置提示", padding="10")
+        info_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        top_frame = ttk.Frame(self.root, padding="5")
-        top_frame.pack(fill=tk.X)
+        top_info_frame = ttk.Frame(info_frame)
+        top_info_frame.pack(fill=tk.X, pady=2)
+        self.rush_hour_label = ttk.Label(top_info_frame, text="")
+        self.rush_hour_label.pack(side=tk.LEFT, padx=5)
+        self.suggested_delay_label = ttk.Label(top_info_frame, text="")
+        self.suggested_delay_label.pack(side=tk.LEFT, padx=5)
+        self.suggested_colo_label = ttk.Label(top_info_frame, text="")
+        self.suggested_colo_label.pack(side=tk.LEFT, padx=5)
         
-        ttk.Label(top_frame, text="IP数:").pack(side=tk.LEFT)
+        self.stats_label = ttk.Label(info_frame, text="")
+        self.stats_label.pack(anchor="w", pady=2)
+        
+        config_frame = ttk.LabelFrame(self.root, text="扫描配置", padding="10")
+        config_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        colo_delay_frame = ttk.Frame(config_frame)
+        colo_delay_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(colo_delay_frame, text="机房代码:").pack(side=tk.LEFT)
+        self.colo_var = tk.StringVar(value="HKG")
+        self.colo_entry = ttk.Entry(colo_delay_frame, textvariable=self.colo_var, width=10)
+        self.colo_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(colo_delay_frame, text="延迟阈值(ms):").pack(side=tk.LEFT, padx=5)
+        self.delay_var = tk.StringVar(value="200")
+        self.delay_entry = ttk.Entry(colo_delay_frame, textvariable=self.delay_var, width=10)
+        self.delay_entry.pack(side=tk.LEFT, padx=5)
+        
+        other_frame = ttk.Frame(config_frame)
+        other_frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Label(other_frame, text="并发任务:").pack(side=tk.LEFT)
+        self.task_var = tk.StringVar(value="100")
+        self.task_entry = ttk.Entry(other_frame, textvariable=self.task_var, width=6)
+        self.task_entry.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(other_frame, text="负载数:").pack(side=tk.LEFT, padx=5)
+        self.num_var = tk.StringVar(value="3")
+        self.num_entry = ttk.Entry(other_frame, textvariable=self.num_var, width=6)
+        self.num_entry.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(other_frame, text="提取IP数:").pack(side=tk.LEFT, padx=5)
         self.ipnum_var = tk.StringVar(value="50")
-        self.ipnum_entry = ttk.Entry(top_frame, textvariable=self.ipnum_var, width=4)
+        self.ipnum_entry = ttk.Entry(other_frame, textvariable=self.ipnum_var, width=6)
         self.ipnum_entry.pack(side=tk.LEFT, padx=2)
         
-        ttk.Label(top_frame, text="服务端口:").pack(side=tk.LEFT)
+        ttk.Label(other_frame, text="服务端口:").pack(side=tk.LEFT, padx=5)
         self.port_var = tk.StringVar(value="8888")
-        self.port_entry = ttk.Entry(top_frame, textvariable=self.port_var, width=5)
+        self.port_entry = ttk.Entry(other_frame, textvariable=self.port_var, width=6)
         self.port_entry.pack(side=tk.LEFT, padx=2)
         
-        self.start_btn = ttk.Button(top_frame, text="启动", command=self.start_cfnat)
-        self.start_btn.pack(side=tk.LEFT, padx=10)
+        btn_frame = ttk.Frame(self.root, padding="5")
+        btn_frame.pack(fill=tk.X)
         
-        self.colo_var = tk.StringVar(value="HKG")
-        self.delay_var = tk.StringVar(value="200")
-        self.task_var = tk.StringVar(value="100")
-        self.num_var = tk.StringVar(value="3")
+        self.start_btn = ttk.Button(btn_frame, text="启动扫描", command=self.start_cfnat)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.restart_btn = ttk.Button(btn_frame, text="重启扫描", command=self.restart_cfnat, state=tk.DISABLED)
+        self.restart_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(btn_frame, text="停止扫描", command=self.stop_cfnat, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
         
         self.log_text = scrolledtext.ScrolledText(self.root, state='disabled', font=('Consolas', 11))
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -800,19 +883,35 @@ class CfnatGUI:
         bottom_frame.pack(fill=tk.X)
         
         ttk.Label(bottom_frame, text="提示: 关闭窗口终止运行").pack(side=tk.LEFT)
+    
+    def update_defaults(self):
+        rush_hour = is_rush_hour()
+        suggested_delay = DEFAULT_CONFIG['delay_rush'] if rush_hour else DEFAULT_CONFIG['delay']
         
-    def on_bat_selected(self, event):
-        selected = self.bat_combo.get()
-        if selected in self.bat_configs:
-            config = self.bat_configs[selected]
-            self.colo_var.set(config['colo'])
-            self.delay_var.set(str(config['delay']))
-            self.task_var.set(str(config['task']))
-            self.num_var.set(str(config['num']))
-            self.ipnum_var.set(str(config['ipnum']))
+        best_colos = get_best_colos_from_stats()
+        suggested_colo = DEFAULT_CONFIG['colo']
+        if best_colos:
+            suggested_colo = best_colos[0]['code']
+            if suggested_colo == '---':
+                suggested_colo = DEFAULT_CONFIG['colo']
         
-    def start_cfnat(self):
-        global running, current_template
+        self.rush_hour_label.config(text=f"时间检测: {'晚高峰 (18:00-22:00)' if rush_hour else '非晚高峰'}")
+        self.suggested_delay_label.config(text=f"建议延迟: {suggested_delay}ms")
+        self.suggested_colo_label.config(text=f"建议机房: {suggested_colo}")
+        
+        if best_colos:
+            stats_text = "上次扫描 - 低延迟机房: "
+            for colo in best_colos[:3]:
+                stats_text += f"{colo['code']}({colo['avg_delay']}ms,{colo['count']}个) "
+            self.stats_label.config(text=stats_text)
+        else:
+            self.stats_label.config(text="暂无上次扫描数据")
+        
+        self.colo_var.set(suggested_colo)
+        self.delay_var.set(str(suggested_delay))
+        
+    def start_cfnat(self, clear_log=True):
+        global running, current_template, current_args
         
         script_dir = os.path.dirname(os.path.abspath(__file__))
         nodes_path = os.path.join(script_dir, NODES_FILE)
@@ -834,18 +933,21 @@ class CfnatGUI:
             messagebox.showerror("错误", "请输入有效的数字")
             return
         
-        self.log_text.configure(state='normal')
-        self.log_text.delete(1.0, tk.END)
-        self.log_text.configure(state='disabled')
+        if clear_log:
+            self.log_text.configure(state='normal')
+            self.log_text.delete(1.0, tk.END)
+            self.log_text.configure(state='disabled')
         
-        gui_print(f"{'='*60}")
-        gui_print(f"  cfnat 本地订阅生成器")
-        gui_print(f"{'='*60}")
+            gui_print(f"{'='*60}")
+            gui_print(f"  cfnat 本地订阅生成器")
+            gui_print(f"{'='*60}")
         
         kill_existing_cfnat()
         
         running = True
         self.start_btn.configure(state=tk.DISABLED)
+        self.restart_btn.configure(state=tk.NORMAL)
+        self.stop_btn.configure(state=tk.NORMAL)
         
         gui_print(f"[启动参数] 机房={colo} 延迟={delay}ms IP数={ipnum}")
         gui_print(f"[节点模版] {NODES_FILE}")
@@ -859,6 +961,7 @@ class CfnatGUI:
         args.num = num
         args.ipnum = ipnum
         args.port = port
+        current_args = args
         
         threading.Thread(target=start_http_server, args=(port,), daemon=True).start()
         
@@ -874,6 +977,33 @@ class CfnatGUI:
                 pass
         
         threading.Thread(target=cfnat_worker, args=(args,), daemon=True).start()
+    
+    def stop_cfnat(self):
+        global running, cfnat_proc
+        running = False
+        if cfnat_proc:
+            try:
+                cfnat_proc.terminate()
+                gui_print("[操作] cfnat 进程已停止")
+            except:
+                pass
+        self.start_btn.configure(state=tk.NORMAL)
+        self.restart_btn.configure(state=tk.DISABLED)
+        self.stop_btn.configure(state=tk.DISABLED)
+    
+    def restart_cfnat(self):
+        global current_args
+        if current_args:
+            self.stop_cfnat()
+            time.sleep(1)
+            self.colo_var.set(current_args.colo)
+            self.delay_var.set(str(current_args.delay))
+            self.task_var.set(str(current_args.task))
+            self.num_var.set(str(current_args.num))
+            self.ipnum_var.set(str(current_args.ipnum))
+            self.port_var.set(str(current_args.port))
+            gui_print("\n[重启] 重新启动扫描...")
+            self.start_cfnat(clear_log=False)
         
     def on_closing(self):
         result = messagebox.askyesnocancel("退出", "是否同时关闭 cfnat 进程？\n\n是 = 关闭脚本和cfnat\n否 = 仅关闭脚本\n取消 = 取消操作")
