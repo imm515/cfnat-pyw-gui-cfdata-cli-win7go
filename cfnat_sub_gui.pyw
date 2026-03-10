@@ -834,8 +834,8 @@ class CfnatGUI:
         colo_delay_frame.pack(fill=tk.X, pady=2)
         ttk.Label(colo_delay_frame, text="机房代码:").pack(side=tk.LEFT)
         self.colo_var = tk.StringVar(value="HKG")
-        self.colo_entry = ttk.Entry(colo_delay_frame, textvariable=self.colo_var, width=10)
-        self.colo_entry.pack(side=tk.LEFT, padx=5)
+        self.colo_combobox = ttk.Combobox(colo_delay_frame, textvariable=self.colo_var, width=10, state='readonly')
+        self.colo_combobox.pack(side=tk.LEFT, padx=5)
         ttk.Label(colo_delay_frame, text="延迟阈值(ms):").pack(side=tk.LEFT, padx=5)
         self.delay_var = tk.StringVar(value="200")
         self.delay_entry = ttk.Entry(colo_delay_frame, textvariable=self.delay_var, width=10)
@@ -906,6 +906,18 @@ class CfnatGUI:
             self.stats_label.config(text=stats_text)
         else:
             self.stats_label.config(text="暂无上次扫描数据")
+        
+        colo_options = []
+        if best_colos:
+            for colo in best_colos:
+                colo_options.append(colo['code'])
+        colo_options.append(DEFAULT_CONFIG['colo'])
+        colo_options.append('NRT')
+        colo_options.append('LAX')
+        colo_options.append('SJC')
+        colo_options.append('SEA')
+        colo_options = list(dict.fromkeys(colo_options))
+        self.colo_combobox['values'] = colo_options
         
         self.colo_var.set(suggested_colo)
         self.delay_var.set(str(suggested_delay))
