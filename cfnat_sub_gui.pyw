@@ -290,6 +290,8 @@ def save_location_stats(stats_data):
         }
         with open(stats_path, 'w', encoding='utf-8') as f:
             json.dump(save_data, f, ensure_ascii=False, indent=2)
+        global last_location_stats
+        last_location_stats = save_data
     except:
         pass
 
@@ -674,6 +676,8 @@ def cfnat_worker(args):
                         gui_print(f"{'总计':<16} {'':<8} {total + other_count:>6}")
                         gui_print(f"{'-'*60}")
                         gui_print(f"")
+                        if gui_app:
+                            gui_app.root.after(0, gui_app.update_defaults)
                     
                     gui_print(f"[扫描发现] 共发现 {len(captured_ips)} 个IP")
                     gui_print(f"[订阅地址] http://127.0.0.1:{args.port}/sub")
@@ -975,9 +979,12 @@ class CfnatGUI:
         args.port = port
         current_args = args
         
-        threading.Thread(target=start_http_server, args=(port,), daemon=True).start()
-        
-        time.sleep(0.5)
+        global http_server
+        if not http_server:
+            threading.Thread(target=start_http_server, args=(port,), daemon=True).start()
+            time.sleep(0.5)
+        else:
+            gui_print(f"[订阅服务] 已在运行中，继续使用现有服务")
         sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
         if os.path.exists(sub_path):
             try:
@@ -1018,17 +1025,32 @@ class CfnatGUI:
             self.start_cfnat(clear_log=False)
         
     def on_closing(self):
-        result = messagebox.askyesnocancel("退出", "是否同时关闭 cfnat 进程？\n\n是 = 关闭脚本和cfnat\n否 = 仅关闭脚本\n取消 = 取消操作")
+        global cfnat_proc, http_server, running
+        result = messagebox.askyesnocancel("退出", "是否同时关闭 cfnat？\n\n是 = 关闭窗口、cfnat和订阅服务（推荐）\n否 = 仅关闭窗口和订阅服务，cfnat继续后台运行\n取消 = 取消操作")
         
         if result is None:
             return
         elif result:
-            global cfnat_proc, http_server, running
             running = False
             if cfnat_proc:
-                cfnat_proc.terminate()
+                try:
+                    cfnat_proc.terminate()
+                    print("[退出] cfnat 进程已关闭")
+                except:
+                    pass
             if http_server:
-                http_server.shutdown()
+                try:
+                    http_server.shutdown()
+                    print("[退出] HTTP 服务器已关闭")
+                except:
+                    pass
+        else:
+            if http_server:
+                try:
+                    http_server.shutdown()
+                    print("[退出] HTTP 服务器已关闭")
+                except:
+                    pass
         
         self.root.destroy()
 
