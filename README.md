@@ -228,4 +228,11 @@ A: 删除 location_stats.json 文件即可重置。
 
 ---
 
+## 致谢
+
+### 原始项目
+
+- [CF_NAT](https://t.me/CF_NAT) - 原始项目来源
+  - **Telegram 频道**: [@CF_NAT](https://t.me/CF_NAT)
+
 **最后更新**: 2026-03-10
