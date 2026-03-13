@@ -75,7 +75,7 @@ python cfnat_sub_gui.pyw --colo HKG --delay 200 --task 100 --num 3 --ipnum 20
 - **负载数**: 每个 IP 的并行连接数，影响负载均衡
 - **提取IP数**: 从扫描结果中提取的 IP 数量，决定 IP 池大小
 
-详细参数说明请参考：[doc/20_cfnat参数详细说明_20260313.md](doc/20_cfnat参数详细说明_20260313.md)
+
 
 ### 控制按钮
 - **启动扫描**：启动 cfnat 扫描和订阅服务
@@ -184,11 +184,12 @@ A: 检查是否已经有一个实例在运行，或删除 `cfnat_sub.pid` 文件
 - 订阅服务：内置 HTTP Server
 - 多线程：cfnat 监控线程 + HTTP 服务线程
 
-## 相关文档
+## 致谢
 
-- 完整项目文档：`../README.md`
-- 开发文档：`../dev/DEVELOPMENT.md`
-- IP 池逻辑：`../dev/IP_POOL_LOGIC.md`
+### 原始项目
+
+- [CF_NAT](https://t.me/CF_NAT) - 原始项目来源
+  - **Telegram 频道**: [@CF_NAT](https://t.me/CF_NAT)
 
 ## 许可证
 
