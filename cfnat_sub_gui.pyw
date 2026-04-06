@@ -23,7 +23,7 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import ipaddress
 
-CFNAT_BIN = "cfdata-cli-win7-experimental.exe"
+CFNAT_BIN = "cfnat-windows7-amd64.exe"
 NODES_FILE = "nodes.txt"
 SUBSCRIPTION_FILE = "subscription.txt"
 LOCATION_CACHE_FILE = "location_cache.json"
@@ -67,8 +67,8 @@ last_progress_done = 0
 last_progress_time = 0
 current_template = None
 
-ip_switch_history = []
-current_ip_start_time = 0
+auto_switch_history = []
+auto_switch_start_time = 0
 MIN_VALIDITY_MINUTES = 10
 MAX_SHORT_VALIDITY_COUNT = 2
 downgrade_attempt_count = 0
@@ -324,12 +324,12 @@ def kill_existing_cfnat():
     if sys.platform == 'win32':
         try:
             result = subprocess.run(
-                ['tasklist', '/FI', f'IMAGENAME eq {CFNAT_BIN}', '/FO', 'CSV', '/NH'],
+                ['tasklist', '/FI', 'IMAGENAME eq cfnat-windows7-amd64.exe', '/FO', 'CSV', '/NH'],
                 capture_output=True, text=True, encoding='gbk', errors='replace'
             )
             lines = result.stdout.strip().split('\n')
             for line in lines:
-                if CFNAT_BIN in line:
+                if 'cfnat-windows7-amd64.exe' in line:
                     parts = line.split(',')
                     if len(parts) >= 2:
                         pid = parts[1].strip('"')
@@ -639,7 +639,7 @@ def is_rush_hour():
 
 
 def check_ip_exhausted():
-    global ip_exhausted_history, cfnat_proc, running, current_args, downgrade_attempt_count, last_used_colos, gui_app, ip_switch_history, current_ip_start_time, current_ip
+    global ip_exhausted_history, cfnat_proc, running, current_args, downgrade_attempt_count, last_used_colos, gui_app, auto_switch_history, auto_switch_start_time, current_ip
     
     if not is_rush_hour():
         return False
@@ -694,8 +694,8 @@ def check_ip_exhausted():
             gui_print(f"")
             gui_print(f"[重启] 使用降级方案重新启动...")
             ip_exhausted_history = []
-            ip_switch_history = []
-            current_ip_start_time = 0
+            auto_switch_history = []
+            auto_switch_start_time = 0
             current_ip = None
             
             if current_args:
@@ -724,7 +724,7 @@ def check_ip_exhausted():
 
 
 def check_ip_exhausted_cli():
-    global ip_exhausted_history, cfnat_proc, running, current_args, downgrade_attempt_count, last_used_colos, ip_switch_history, current_ip_start_time, current_ip
+    global ip_exhausted_history, cfnat_proc, running, current_args, downgrade_attempt_count, last_used_colos, auto_switch_history, auto_switch_start_time, current_ip
     
     if not is_rush_hour():
         return False
@@ -776,8 +776,8 @@ def check_ip_exhausted_cli():
             
             print(f"\n[重启] 使用降级方案重新启动...")
             ip_exhausted_history = []
-            ip_switch_history = []
-            current_ip_start_time = 0
+            auto_switch_history = []
+            auto_switch_start_time = 0
             current_ip = None
             
             if current_args:
@@ -1222,8 +1222,8 @@ def replace_node_ip(node, new_ip, idx=None):
     return node
 
 
-def check_ip_switch_too_frequent():
-    global ip_switch_history, cfnat_proc, running, current_ip_start_time, downgrade_attempt_count, last_used_colos, current_args
+def check_ip_switch_too_frequent(new_ip):
+    global auto_switch_history, cfnat_proc, running, auto_switch_start_time, downgrade_attempt_count, last_used_colos, current_args
 
     if is_rush_hour():
         return False
@@ -1231,16 +1231,16 @@ def check_ip_switch_too_frequent():
     current_time = time.time()
     
     validity_minutes = 0
-    if current_ip_start_time > 0:
-        validity_minutes = (current_time - current_ip_start_time) / 60
+    if auto_switch_start_time > 0:
+        validity_minutes = (current_time - auto_switch_start_time) / 60
     
-    current_ip_start_time = current_time
-    ip_switch_history.append({'time': current_time, 'ip': current_ip, 'validity': validity_minutes})
+    auto_switch_start_time = current_time
+    auto_switch_history.append({'time': current_time, 'ip': new_ip, 'validity': validity_minutes})
 
-    if len(ip_switch_history) < MAX_SHORT_VALIDITY_COUNT + 1:
+    if len(auto_switch_history) < MAX_SHORT_VALIDITY_COUNT + 1:
         return False
 
-    recent_switches = ip_switch_history[-(MAX_SHORT_VALIDITY_COUNT + 1):]
+    recent_switches = auto_switch_history[-(MAX_SHORT_VALIDITY_COUNT + 1):]
     intervals = []
     for i in range(1, len(recent_switches)):
         interval_minutes = (recent_switches[i]['time'] - recent_switches[i-1]['time']) / 60
@@ -1385,34 +1385,8 @@ def start_http_server(port):
         gui_print(f"[错误] 启动HTTP服务失败: {e}")
 
 
-def ensure_subscription_service_active(port):
-    global http_server, subscription_ip
-
-    if not subscription_ip:
-        cached_ip = load_subscription_ip_from_cache()
-        if cached_ip:
-            subscription_ip = cached_ip
-
-    if http_server:
-        gui_print(f"[订阅服务] 已在运行中，继续使用现有服务")
-        return True
-
-    threading.Thread(target=start_http_server, args=(port,), daemon=True).start()
-    time.sleep(0.5)
-
-    if http_server:
-        if subscription_ip:
-            gui_print(f"[订阅激活] 已恢复缓存订阅IP: {subscription_ip}")
-        else:
-            gui_print(f"[订阅激活] 已启动订阅服务，当前将直接提供缓存订阅内容")
-        return True
-
-    gui_print(f"[错误] 订阅服务激活失败，请检查端口 {port} 是否被占用")
-    return False
-
-
 def cfnat_worker(args):
-    global captured_ips, captured_data, cfnat_proc, running, location_stats, current_ip_start_time, ip_switch_history
+    global captured_ips, captured_data, cfnat_proc, running, location_stats, auto_switch_start_time, auto_switch_history
     global scan_start_time, current_ip, ip_refresh_counts, subscription_ip, last_refresh_ip, ip_exhausted_history
     global ip_delays, last_log_time, valid_ip_count, subscription_locked
     
@@ -1550,7 +1524,8 @@ def cfnat_worker(args):
                         
                         if captured_ips:
                             current_ip = captured_ips[0]
-                            current_ip_start_time = time.time()
+                            auto_switch_history = []
+                            auto_switch_start_time = 0
                             last_best_ip = None
                     continue
                 
@@ -1621,7 +1596,7 @@ def cfnat_worker(args):
                     if new_ip != current_ip:
                         old_ip = current_ip
                         current_ip = new_ip
-                        if check_ip_switch_too_frequent():
+                        if check_ip_switch_too_frequent(new_ip):
                             running = False
                             break
                         
@@ -1703,9 +1678,7 @@ def cfnat_worker(args):
                         if ip != current_ip:
                             old_ip = current_ip
                             current_ip = ip
-                            if check_ip_switch_too_frequent():
-                                running = False
-                                break
+                            # 初始 best/refresh 更新不计入“自动切换频繁”统计
                         
                         update_result = update_subscription_if_needed()
                         if update_result[0]:
@@ -2098,16 +2071,6 @@ class CfnatGUI:
             gui_print("[订阅测速] 正在测速中，请等待当前任务完成")
             return
 
-        try:
-            port = int(self.port_var.get())
-        except ValueError:
-            messagebox.showerror("错误", "请输入有效的端口号")
-            return
-
-        if not ensure_subscription_service_active(port):
-            messagebox.showerror("订阅服务", f"订阅服务激活失败，请检查端口 {port} 是否被占用")
-            return
-
         target, err = get_subscription_speedtest_target()
         if err:
             messagebox.showwarning("订阅测速", err)
@@ -2284,7 +2247,7 @@ def start_http_server_cli(port):
 
 
 def cfnat_worker_cli(args):
-    global captured_ips, captured_data, cfnat_proc, running, location_stats, current_ip_start_time, ip_switch_history
+    global captured_ips, captured_data, cfnat_proc, running, location_stats, auto_switch_start_time, auto_switch_history
     global scan_start_time, current_ip, current_args, ip_refresh_counts, subscription_ip, last_refresh_ip, ip_exhausted_history
     global ip_delays, last_log_time, valid_ip_count, subscription_locked
     
@@ -2412,7 +2375,8 @@ def cfnat_worker_cli(args):
                         
                         if captured_ips:
                             current_ip = captured_ips[0]
-                            current_ip_start_time = time.time()
+                            auto_switch_history = []
+                            auto_switch_start_time = 0
                             last_best_ip = None
                     continue
                 
@@ -2478,7 +2442,7 @@ def cfnat_worker_cli(args):
                     if new_ip != current_ip:
                         old_ip = current_ip
                         current_ip = new_ip
-                        if check_ip_switch_too_frequent_cli():
+                        if check_ip_switch_too_frequent_cli(new_ip):
                             running = False
                             break
                         
@@ -2559,9 +2523,7 @@ def cfnat_worker_cli(args):
                         if ip != current_ip:
                             old_ip = current_ip
                             current_ip = ip
-                            if check_ip_switch_too_frequent_cli():
-                                running = False
-                                break
+                            # 初始 best/refresh 更新不计入“自动切换频繁”统计
                         
                         update_result = update_subscription_if_needed()
                         if update_result[0]:
@@ -2621,8 +2583,8 @@ def cfnat_worker_cli(args):
         time.sleep(2)
 
 
-def check_ip_switch_too_frequent_cli():
-    global ip_switch_history, cfnat_proc, running, current_ip_start_time, downgrade_attempt_count, last_used_colos, current_args
+def check_ip_switch_too_frequent_cli(new_ip):
+    global auto_switch_history, cfnat_proc, running, auto_switch_start_time, downgrade_attempt_count, last_used_colos, current_args
 
     if is_rush_hour():
         return False
@@ -2630,16 +2592,16 @@ def check_ip_switch_too_frequent_cli():
     current_time = time.time()
     
     validity_minutes = 0
-    if current_ip_start_time > 0:
-        validity_minutes = (current_time - current_ip_start_time) / 60
+    if auto_switch_start_time > 0:
+        validity_minutes = (current_time - auto_switch_start_time) / 60
     
-    current_ip_start_time = current_time
-    ip_switch_history.append({'time': current_time, 'ip': current_ip, 'validity': validity_minutes})
+    auto_switch_start_time = current_time
+    auto_switch_history.append({'time': current_time, 'ip': new_ip, 'validity': validity_minutes})
 
-    if len(ip_switch_history) < MAX_SHORT_VALIDITY_COUNT + 1:
+    if len(auto_switch_history) < MAX_SHORT_VALIDITY_COUNT + 1:
         return False
 
-    recent_switches = ip_switch_history[-(MAX_SHORT_VALIDITY_COUNT + 1):]
+    recent_switches = auto_switch_history[-(MAX_SHORT_VALIDITY_COUNT + 1):]
     intervals = []
     for i in range(1, len(recent_switches)):
         interval_minutes = (recent_switches[i]['time'] - recent_switches[i-1]['time']) / 60
