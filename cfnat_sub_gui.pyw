@@ -1385,6 +1385,32 @@ def start_http_server(port):
         gui_print(f"[错误] 启动HTTP服务失败: {e}")
 
 
+def ensure_subscription_service_active(port):
+    global http_server, subscription_ip
+
+    if not subscription_ip:
+        cached_ip = load_subscription_ip_from_cache()
+        if cached_ip:
+            subscription_ip = cached_ip
+
+    if http_server:
+        gui_print(f"[订阅服务] 已在运行中，继续使用现有服务")
+        return True
+
+    threading.Thread(target=start_http_server, args=(port,), daemon=True).start()
+    time.sleep(0.5)
+
+    if http_server:
+        if subscription_ip:
+            gui_print(f"[订阅激活] 已恢复缓存订阅IP: {subscription_ip}")
+        else:
+            gui_print(f"[订阅激活] 已启动订阅服务，当前将直接提供缓存订阅内容")
+        return True
+
+    gui_print(f"[错误] 订阅服务激活失败，请检查端口 {port} 是否被占用")
+    return False
+
+
 def cfnat_worker(args):
     global captured_ips, captured_data, cfnat_proc, running, location_stats, current_ip_start_time, ip_switch_history
     global scan_start_time, current_ip, ip_refresh_counts, subscription_ip, last_refresh_ip, ip_exhausted_history
@@ -2070,6 +2096,16 @@ class CfnatGUI:
 
         if subscription_speedtest_running:
             gui_print("[订阅测速] 正在测速中，请等待当前任务完成")
+            return
+
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的端口号")
+            return
+
+        if not ensure_subscription_service_active(port):
+            messagebox.showerror("订阅服务", f"订阅服务激活失败，请检查端口 {port} 是否被占用")
             return
 
         target, err = get_subscription_speedtest_target()
