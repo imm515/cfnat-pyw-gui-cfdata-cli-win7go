@@ -97,6 +97,13 @@ python cfnat_sub_gui.pyw
 
 这些都属于本地运行产物，不属于公开仓库必须提交的内容。
 
+## 致谢
+
+### 原始项目
+
+- [CF_NAT](https://t.me/CF_NAT) - 原始项目来源
+  - **Telegram 频道**: [@CF_NAT](https://t.me/CF_NAT)
+
 ## License
 
 See [LICENSE](LICENSE).
