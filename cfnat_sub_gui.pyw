@@ -60,6 +60,9 @@ captured_data = []
 current_ip = ""
 cfnat_proc = None
 http_server = None
+http_server_port = None
+http_server_starting = False
+http_server_lock = threading.Lock()
 running = True
 location_stats = {}
 scan_start_time = 0
@@ -1364,10 +1367,13 @@ class SubHandler(http.server.BaseHTTPRequestHandler):
 
 
 def start_http_server(port):
-    global http_server
+    global http_server, http_server_port, http_server_starting
     try:
-        http_server = socketserver.TCPServer(('0.0.0.0', port), SubHandler)
-        http_server.allow_reuse_address = True
+        server = socketserver.TCPServer(('0.0.0.0', port), SubHandler)
+        with http_server_lock:
+            http_server = server
+            http_server_port = port
+            http_server_starting = False
         local_ip = get_local_ip()
         gui_print(f"")
         gui_print(f"{'='*60}")
@@ -1380,23 +1386,65 @@ def start_http_server(port):
         gui_print(f"[提示] 订阅内容会随 IP 优选自动更新，无需手动刷新")
         gui_print(f"{'='*60}")
         gui_print(f"")
-        http_server.serve_forever()
+        server.serve_forever()
     except Exception as e:
+        with http_server_lock:
+            if http_server is None:
+                http_server_port = None
+            http_server_starting = False
         gui_print(f"[错误] 启动HTTP服务失败: {e}")
+    finally:
+        with http_server_lock:
+            server_ref = http_server
+            http_server = None
+            http_server_port = None
+            http_server_starting = False
+        if server_ref:
+            try:
+                server_ref.server_close()
+            except:
+                pass
 
 
 def ensure_subscription_service_running(port):
-    global http_server
+    global http_server, http_server_port, http_server_starting
 
-    if not http_server:
+    need_start = False
+    with http_server_lock:
+        if http_server:
+            if http_server_port and http_server_port != port:
+                gui_print(f"[订阅服务] 已在端口 {http_server_port} 运行，请先停止后再切换端口 {port}")
+                return False
+            gui_print(f"[订阅服务] 已在运行中，继续使用现有服务")
+        elif http_server_starting:
+            gui_print(f"[订阅服务] 正在启动中，请稍候...")
+        else:
+            http_server_starting = True
+            http_server_port = port
+            need_start = True
+
+    if need_start:
         threading.Thread(target=start_http_server, args=(port,), daemon=True).start()
-        time.sleep(0.5)
-    else:
-        gui_print(f"[订阅服务] 已在运行中，继续使用现有服务")
+
+    for _ in range(20):
+        with http_server_lock:
+            if http_server:
+                break
+            still_starting = http_server_starting
+        if not still_starting:
+            break
+        time.sleep(0.1)
+
+    with http_server_lock:
+        service_ready = http_server is not None
+    if not service_ready:
+        gui_print(f"[错误] 订阅服务启动失败，请稍后重试")
+        return False
 
     cached_content = load_cached_subscription_content()
     if cached_content:
         gui_print(f"[订阅文件] 使用缓存内容: {SUBSCRIPTION_FILE}")
+    return True
 
 
 def cfnat_worker(args):
@@ -1921,7 +1969,7 @@ class CfnatGUI:
         self.delay_var.set(str(suggested_delay))
         
     def start_cfnat(self, clear_log=True):
-        global running, current_template, current_args
+        global running, current_template, current_args, subscription_speedtest_running
         
         script_dir = os.path.dirname(os.path.abspath(__file__))
         nodes_path = os.path.join(script_dir, NODES_FILE)
@@ -1951,6 +1999,11 @@ class CfnatGUI:
             gui_print(f"{'='*60}")
             gui_print(f"  cfnat 本地订阅生成器")
             gui_print(f"{'='*60}")
+
+        if subscription_speedtest_running:
+            messagebox.showwarning("冲突提示", "订阅测速进行中，请等待结束后再启动扫描")
+            gui_print("[冲突避免] 订阅测速进行中，已阻止扫描启动")
+            return
         
         kill_existing_cfnat()
         
@@ -1974,12 +2027,13 @@ class CfnatGUI:
         args.port = port
         current_args = args
         
-        global http_server
-        if not http_server:
-            threading.Thread(target=start_http_server, args=(port,), daemon=True).start()
-            time.sleep(0.5)
-        else:
-            gui_print(f"[订阅服务] 已在运行中，继续使用现有服务")
+        if not ensure_subscription_service_running(port):
+            running = False
+            self.start_btn.configure(state=tk.NORMAL)
+            self.manual_ip_btn.configure(state=tk.NORMAL)
+            self.restart_btn.configure(state=tk.DISABLED)
+            self.stop_btn.configure(state=tk.DISABLED)
+            return
         sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
         if os.path.exists(sub_path):
             try:
@@ -1993,7 +2047,7 @@ class CfnatGUI:
         threading.Thread(target=cfnat_worker, args=(args,), daemon=True).start()
     
     def start_with_manual_ip(self):
-        global running, current_template, current_ip, subscription_ip, subscription_locked, captured_ips, captured_data
+        global running, current_template, current_ip, subscription_ip, subscription_locked, captured_ips, captured_data, subscription_speedtest_running
         
         script_dir = os.path.dirname(os.path.abspath(__file__))
         nodes_path = os.path.join(script_dir, NODES_FILE)
@@ -2031,6 +2085,11 @@ class CfnatGUI:
         gui_print(f"{'='*60}")
         gui_print(f"  cfnat 本地订阅生成器 - 手动IP模式")
         gui_print(f"{'='*60}")
+
+        if subscription_speedtest_running:
+            messagebox.showwarning("冲突提示", "订阅测速进行中，请等待结束后再启动")
+            gui_print("[冲突避免] 订阅测速进行中，已阻止手动IP启动")
+            return
         
         kill_existing_cfnat()
         
@@ -2054,12 +2113,13 @@ class CfnatGUI:
         
         gui_print(f"[订阅IP] 已设置为: {subscription_ip}")
         
-        global http_server
-        if not http_server:
-            threading.Thread(target=start_http_server, args=(port,), daemon=True).start()
-            time.sleep(0.5)
-        else:
-            gui_print(f"[订阅服务] 已在运行中，继续使用现有服务")
+        if not ensure_subscription_service_running(port):
+            running = False
+            self.start_btn.configure(state=tk.NORMAL)
+            self.manual_ip_btn.configure(state=tk.NORMAL)
+            self.restart_btn.configure(state=tk.DISABLED)
+            self.stop_btn.configure(state=tk.DISABLED)
+            return
         
         generate_subscription([subscription_ip])
         
@@ -2091,7 +2151,8 @@ class CfnatGUI:
             messagebox.showerror("错误", "请输入有效的端口号")
             return
 
-        ensure_subscription_service_running(port)
+        if not ensure_subscription_service_running(port):
+            return
 
         target, err = get_subscription_speedtest_target()
         if err:
