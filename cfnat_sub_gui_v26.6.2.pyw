@@ -1,0 +1,2878 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+cfnat 本地订阅生成器 - GUI版本
+"""
+
+import subprocess
+import re
+import base64
+import json
+import http.server
+import socketserver
+import threading
+import socket
+import ssl
+import sys
+import os
+import time
+import argparse
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import ipaddress
+
+CFNAT_BIN = "cfnat-windows7-amd64.exe"
+NODES_FILE = "nodes.txt"
+SUBSCRIPTION_FILE = "subscription.txt"
+LOCATION_CACHE_FILE = "location_cache.json"
+LOCATION_STATS_FILE = "location_stats.json"
+SETTINGS_FILE = "settings.json"  # 用户设置文件
+DEFAULT_PORT = 8888
+MAX_NODES = 20
+SUB_PATH = "/sub"
+LOCATION_DATA = None
+LOCATION_CACHE = {}
+PID_FILE = "cfnat_sub.pid"
+APP_VERSION = "v26.6.2"
+
+DEFAULT_CONFIG = {
+    'colo': 'HKG',
+    'delay': 300,
+    'delay_rush': 300,
+    'task': 100,
+    'num': 3,
+    'ipnum': 20,
+}
+
+DEFAULT_SETTINGS = {
+    'save_cfnat_log': False,  # 默认关闭cfnat日志保存
+    'manual_ip': '',          # 记住上次手动输入的IP
+}
+
+LOG_REFRESH_INTERVAL = 5  # 日志刷新间隔，单位秒
+
+last_location_stats = {}
+current_args = None
+
+captured_ips = []
+captured_data = []
+current_ip = ""
+cfnat_proc = None
+http_server = None
+http_server_port = None
+http_server_starting = False
+http_server_lock = threading.Lock()
+running = True
+location_stats = {}
+scan_start_time = 0
+last_progress_done = 0
+last_progress_time = 0
+current_template = None
+
+auto_switch_history = []
+auto_switch_start_time = 0
+MIN_VALIDITY_MINUTES = 10
+MAX_SHORT_VALIDITY_COUNT = 2
+downgrade_attempt_count = 0
+last_used_colos = []
+current_args = None
+
+gui_app = None
+
+ip_refresh_counts = {}
+ip_delays = {}          # 记录每个IP的最新延迟 {IP: 延迟ms}
+subscription_ip = None
+last_refresh_ip = None
+last_log_time = 0       # 上次日志刷新时间
+ip_exhausted_history = []
+MAX_IP_EXHAUSTED_COUNT = 2
+valid_ip_count = 0      # 有效IP数量（cfnat提取的）
+
+# 订阅锁定策略
+subscription_locked = False      # 订阅IP是否已锁定
+SUBSCRIPTION_LOCK_THRESHOLD = 10 # 刷新次数达到此值后锁定订阅IP
+
+# cfnat日志保存
+save_cfnat_log = False  # 默认关闭日志保存
+cfnat_log_file = None
+CFNAT_LOG_DIR = "logs"
+CFNAT_LOG_KEEP_DAYS = 2
+SPEEDTEST_URL = "speed.cloudflare.com/__down?bytes=10000000"
+SPEEDTEST_CONNECT_TIMEOUT = 5
+SPEEDTEST_READ_TIMEOUT = 5
+SPEEDTEST_DURATION = 5.0
+SPEEDTEST_WINDOW = 0.5
+TLS_PORTS = {443, 2053, 2083, 2087, 2096, 8443}
+subscription_speedtest_running = False
+log_last_line_replaceable = False
+
+
+def validate_ip(ip_str):
+    """
+    验证IP地址格式（支持IPv4和IPv6）
+    返回: (是否有效, IP类型, 错误信息)
+    """
+    ip_str = ip_str.strip()
+    if not ip_str:
+        return (False, None, "IP地址不能为空")
+    
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        if ip.version == 4:
+            return (True, 'IPv4', None)
+        else:
+            return (True, 'IPv6', None)
+    except ValueError as e:
+        return (False, None, f"无效的IP地址格式: {ip_str}")
+
+
+def validate_single_ip(ip_str):
+    """
+    验证单个IP地址
+    返回: (是否有效, IP类型, 错误信息)
+    """
+    if not ip_str or not ip_str.strip():
+        return (False, None, "请输入IP地址")
+    
+    ip_str = ip_str.strip()
+    
+    if ',' in ip_str:
+        return (False, None, "只支持单个IP地址，请勿输入多个IP")
+    
+    return validate_ip(ip_str)
+
+
+def load_settings():
+    """
+    加载用户设置
+    返回: 设置字典
+    """
+    settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILE)
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+            return {**DEFAULT_SETTINGS, **settings}  # 合并默认设置和用户设置
+        except:
+            pass
+    return DEFAULT_SETTINGS.copy()
+
+
+def save_settings(settings):
+    """
+    保存用户设置
+    """
+    settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILE)
+    try:
+        with open(settings_path, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[警告] 保存设置失败: {e}")
+
+
+def load_subscription_ip_from_cache():
+    """
+    从订阅缓存文件中恢复订阅IP
+    返回: IP地址或None
+    """
+    sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
+    if not os.path.exists(sub_path):
+        return None
+    
+    try:
+        with open(sub_path, 'r', encoding='utf-8') as f:
+            cached_content = f.read().strip()
+        
+        if not cached_content:
+            return None
+        
+        # Base64解码
+        decoded = base64.b64decode(cached_content).decode('utf-8')
+        
+        # 按行分割，查找第一个有效IP
+        ip_pattern = re.compile(r'@(\d{1,3}(?:\.\d{1,3}){3}):\d+')
+        
+        for line in decoded.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            
+            match = ip_pattern.search(line)
+            if match:
+                ip = match.group(1)
+                # 跳过本地地址
+                if ip not in ('127.0.0.1', '0.0.0.0', 'localhost'):
+                    return ip
+        
+        return None
+    except Exception as e:
+        return None
+
+
+def init_cfnat_log():
+    """初始化cfnat日志文件，创建日志目录并清理过期日志"""
+    global cfnat_log_file
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(script_dir, CFNAT_LOG_DIR)
+    
+    # 创建日志目录
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # 清理超过2天的日志
+    clean_old_logs(log_dir)
+    
+    # 创建新的日志文件
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    cfnat_log_file = os.path.join(log_dir, f"cfnat_{timestamp}.log")
+    
+    # 写入日志头
+    with open(cfnat_log_file, 'w', encoding='utf-8') as f:
+        f.write(f"{'='*60}\n")
+        f.write(f"cfnat 日志文件\n")
+        f.write(f"创建时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"{'='*60}\n\n")
+    
+    return cfnat_log_file
+
+
+def clean_old_logs(log_dir):
+    """清理超过指定天数的日志文件"""
+    now = time.time()
+    cutoff_time = now - (CFNAT_LOG_KEEP_DAYS * 24 * 60 * 60)
+    
+    try:
+        for filename in os.listdir(log_dir):
+            if filename.startswith('cfnat_') and filename.endswith('.log'):
+                filepath = os.path.join(log_dir, filename)
+                if os.path.isfile(filepath):
+                    file_mtime = os.path.getmtime(filepath)
+                    if file_mtime < cutoff_time:
+                        os.remove(filepath)
+                        gui_print(f"[日志清理] 已删除过期日志: {filename}")
+    except Exception as e:
+        gui_print(f"[日志清理] 清理失败: {e}")
+
+
+def write_cfnat_log(line):
+    """写入一行日志到cfnat日志文件，智能过滤扫描过程中的刷屏信息"""
+    global cfnat_log_file, save_cfnat_log
+    
+    if not save_cfnat_log or not cfnat_log_file:
+        return
+    
+    # 处理扫描进度行 - 只记录关键百分比节点
+    progress_match = re.search(r'已完成:\s*(\d+)\s+总数:\s*(\d+)', line)
+    if progress_match:
+        done, total = int(progress_match.group(1)), int(progress_match.group(2))
+        if total > 0:
+            pct = int(done / total * 100)
+            # 只记录：开头(0%)、每25%、结尾(100%)
+            if pct == 0 or pct >= 100 or pct % 25 == 0:
+                # 避免重复记录同一百分比
+                pct_key = f"log_pct_{pct}"
+                if getattr(write_cfnat_log, pct_key, None) != total:
+                    setattr(write_cfnat_log, pct_key, total)
+                    try:
+                        with open(cfnat_log_file, 'a', encoding='utf-8') as f:
+                            f.write(f"[扫描进度] {pct}% ({done}/{total})\n")
+                    except:
+                        pass
+        return
+    
+    # 处理发现有效IP行 - 只记录前3个和最后1个
+    valid_ip_match = re.search(r'发现有效IP\s+(\d+\.\d+\.\d+\.\d+)\s+位置信息\s+(.+?)\s+延迟\s+(\d+)', line)
+    if valid_ip_match:
+        ip, location, delay = valid_ip_match.groups()
+        # 使用计数器控制记录数量
+        if not hasattr(write_cfnat_log, 'valid_ip_count'):
+            write_cfnat_log.valid_ip_count = 0
+        write_cfnat_log.valid_ip_count += 1
+        count = write_cfnat_log.valid_ip_count
+        # 只记录前3个，其他跳过
+        if count <= 3:
+            try:
+                with open(cfnat_log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"[发现IP-{count}] {ip} ({location}) 延迟{delay}ms\n")
+            except:
+                pass
+        return
+    
+    # 扫描完成时重置计数器并记录总数
+    if '成功提取' in line and '个有效IP' in line:
+        if hasattr(write_cfnat_log, 'valid_ip_count'):
+            total_found = write_cfnat_log.valid_ip_count
+            write_cfnat_log.valid_ip_count = 0
+            # 清除百分比标记
+            for attr in list(write_cfnat_log.__dict__.keys() if hasattr(write_cfnat_log, '__dict__') else []):
+                if attr.startswith('log_pct_'):
+                    delattr(write_cfnat_log, attr)
+            try:
+                with open(cfnat_log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"[扫描完成] 共发现 {total_found} 个有效IP\n")
+            except:
+                pass
+            return
+    
+    try:
+        with open(cfnat_log_file, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except Exception as e:
+        pass  # 静默失败，不影响主程序
+
+
+def kill_existing_cfnat():
+    if sys.platform == 'win32':
+        try:
+            result = subprocess.run(
+                ['tasklist', '/FI', 'IMAGENAME eq cfnat-windows7-amd64.exe', '/FO', 'CSV', '/NH'],
+                capture_output=True, text=True, encoding='gbk', errors='replace'
+            )
+            lines = result.stdout.strip().split('\n')
+            for line in lines:
+                if 'cfnat-windows7-amd64.exe' in line:
+                    parts = line.split(',')
+                    if len(parts) >= 2:
+                        pid = parts[1].strip('"')
+                        try:
+                            subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True)
+                            print(f"[清理] 已关闭残留进程: PID {pid}")
+                            gui_print(f"[清理] 已关闭残留进程: PID {pid}")
+                        except:
+                            pass
+        except:
+            pass
+
+
+def check_single_instance():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    pid_path = os.path.join(script_dir, PID_FILE)
+    
+    if os.path.exists(pid_path):
+        try:
+            with open(pid_path, 'r') as f:
+                old_pid = int(f.read().strip())
+            
+            if sys.platform == 'win32':
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                STILL_ACTIVE = 259
+                
+                handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, old_pid)
+                if handle:
+                    try:
+                        exit_code = ctypes.c_ulong()
+                        if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                            if exit_code.value == STILL_ACTIVE:
+                                kernel32.CloseHandle(handle)
+                                return False
+                    finally:
+                        kernel32.CloseHandle(handle)
+        except:
+            pass
+    
+    try:
+        with open(pid_path, 'w') as f:
+            f.write(str(os.getpid()))
+    except:
+        pass
+    
+    return True
+
+
+def cleanup_pid_file():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    pid_path = os.path.join(script_dir, PID_FILE)
+    try:
+        if os.path.exists(pid_path):
+            with open(pid_path, 'r') as f:
+                saved_pid = int(f.read().strip())
+            if saved_pid == os.getpid():
+                os.remove(pid_path)
+    except:
+        pass
+
+
+def parse_bat_config(bat_path):
+    config = {
+        'colo': 'HKG',
+        'delay': 200,
+        'task': 100,
+        'num': 3,
+        'ipnum': 20,
+    }
+    try:
+        with open(bat_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        colo_match = re.search(r'-colo\s+"?(\w+)"?', content)
+        if colo_match:
+            config['colo'] = colo_match.group(1).upper()
+        
+        delay_match = re.search(r'-delay\s+(\d+)', content)
+        if delay_match:
+            config['delay'] = int(delay_match.group(1))
+        
+        task_match = re.search(r'-task\s+(\d+)', content)
+        if task_match:
+            config['task'] = int(task_match.group(1))
+        
+        num_match = re.search(r'-num\s+(\d+)', content)
+        if num_match:
+            config['num'] = int(num_match.group(1))
+        
+        ipnum_match = re.search(r'-ipnum\s+(\d+)', content)
+        if ipnum_match:
+            config['ipnum'] = int(ipnum_match.group(1))
+        
+        return config
+    except:
+        return config
+
+
+def find_bat_files():
+    bat_files = []
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for f in os.listdir(script_dir):
+        if f.startswith('启动cfnat-') and f.endswith('.bat'):
+            bat_files.append(f)
+    return sorted(bat_files)
+
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return '127.0.0.1'
+
+
+def gui_print(msg):
+    if gui_app and gui_app.log_text:
+        try:
+            gui_app.root.after(0, lambda: _gui_print_impl(msg))
+        except:
+            print(msg)
+    else:
+        print(msg)
+
+
+def _gui_print_impl(msg):
+    global log_last_line_replaceable
+    if gui_app and gui_app.log_text:
+        try:
+            gui_app.log_text.configure(state='normal')
+            gui_app.log_text.insert(tk.END, msg + '\n')
+            gui_app.log_text.see(tk.END)
+            gui_app.log_text.configure(state='disabled')
+            log_last_line_replaceable = False
+        except:
+            pass
+
+
+def gui_print_replace(msg):
+    if gui_app and gui_app.log_text:
+        try:
+            gui_app.root.after(0, lambda: _gui_print_replace_impl(msg))
+        except:
+            print(msg)
+    else:
+        print(msg)
+
+
+def gui_print_refresh(msg):
+    if gui_app and gui_app.log_text:
+        try:
+            gui_app.root.after(0, lambda: _gui_print_refresh_impl(msg))
+        except:
+            print(msg)
+    else:
+        print(msg)
+
+
+def _gui_print_replace_impl(msg):
+    global log_last_line_replaceable
+    if gui_app and gui_app.log_text:
+        try:
+            gui_app.log_text.configure(state='normal')
+            if log_last_line_replaceable:
+                gui_app.log_text.delete("end-2l", "end-1l")
+            gui_app.log_text.insert(tk.END, msg + '\n')
+            gui_app.log_text.see(tk.END)
+            gui_app.log_text.configure(state='disabled')
+            log_last_line_replaceable = True
+        except:
+            pass
+
+
+def _gui_print_refresh_impl(msg):
+    global log_last_line_replaceable
+    if gui_app and gui_app.log_text:
+        try:
+            gui_app.log_text.configure(state='normal')
+            if log_last_line_replaceable:
+                gui_app.log_text.delete("end-2l", "end-1l")
+            gui_app.log_text.insert(tk.END, msg + '\n')
+            gui_app.log_text.see(tk.END)
+            gui_app.log_text.configure(state='disabled')
+            log_last_line_replaceable = True
+        except:
+            pass
+
+
+def load_location_data():
+    global LOCATION_DATA, LOCATION_CACHE
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    cache_path = os.path.join(script_dir, LOCATION_CACHE_FILE)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                LOCATION_CACHE = json.load(f)
+        except:
+            LOCATION_CACHE = {}
+    
+    locations_path = os.path.join(script_dir, 'locations.json')
+    if os.path.exists(locations_path):
+        try:
+            with open(locations_path, 'r', encoding='utf-8') as f:
+                LOCATION_DATA = json.load(f)
+        except:
+            LOCATION_DATA = None
+
+
+def save_location_cache():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_path = os.path.join(script_dir, LOCATION_CACHE_FILE)
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(LOCATION_CACHE, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
+
+def load_location_stats():
+    global last_location_stats
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    stats_path = os.path.join(script_dir, LOCATION_STATS_FILE)
+    if os.path.exists(stats_path):
+        try:
+            with open(stats_path, 'r', encoding='utf-8') as f:
+                last_location_stats = json.load(f)
+        except:
+            last_location_stats = {}
+
+
+def save_location_stats(stats_data):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    stats_path = os.path.join(script_dir, LOCATION_STATS_FILE)
+    try:
+        save_data = {
+            'timestamp': datetime.now().isoformat(),
+            'stats': stats_data
+        }
+        with open(stats_path, 'w', encoding='utf-8') as f:
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
+        global last_location_stats
+        last_location_stats = save_data
+    except:
+        pass
+
+
+
+
+
+def get_next_downgrade_colo(current_colo):
+    colos = get_best_colos_from_stats()
+    if not colos:
+        colo_order = ['HKG', 'NRT', 'SJC', 'LAX', 'SEA']
+        try:
+            current_idx = colo_order.index(current_colo)
+            if current_idx < len(colo_order) - 1:
+                return colo_order[current_idx + 1]
+            else:
+                return colo_order[-1]
+        except ValueError:
+            return 'NRT'
+    
+    codes = [c['code'] for c in colos if c['code'] != '---']
+    try:
+        current_idx = codes.index(current_colo)
+        if current_idx < len(codes) - 1:
+            return codes[current_idx + 1]
+        else:
+            return codes[-1]
+    except ValueError:
+        if codes:
+            return codes[0]
+        return 'NRT'
+
+
+def get_best_colos_from_stats():
+    if not last_location_stats or 'stats' not in last_location_stats:
+        return []
+    stats = last_location_stats['stats']
+    colos = []
+    for loc, data in stats.items():
+        if data.get('count', 0) >= 10:
+            avg_delay = (data.get('min_delay', 9999) + data.get('max_delay', 0)) // 2
+            code = get_location_code(loc)
+            colos.append({
+                'name': loc,
+                'code': code,
+                'count': data['count'],
+                'avg_delay': avg_delay
+            })
+    
+    colos.sort(key=lambda x: (-x['count'], x['avg_delay'], x['code']))
+    
+    return colos
+
+
+def is_rush_hour():
+    now = datetime.now()
+    hour = now.hour
+    return 20 <= hour <= 23 or 0 <= hour <= 1
+
+
+def check_ip_exhausted():
+    global ip_exhausted_history, cfnat_proc, running, current_args, downgrade_attempt_count, last_used_colos, gui_app, auto_switch_history, auto_switch_start_time, current_ip
+    
+    if not is_rush_hour():
+        return False
+    
+    current_time = time.time()
+    
+    # 防止同一秒内重复记录（如果最近1秒内已记录，则跳过）
+    if ip_exhausted_history:
+        last_time = ip_exhausted_history[-1]['time']
+        if current_time - last_time < 1:
+            return False
+    
+    ip_exhausted_history.append({'time': current_time})
+    
+    if len(ip_exhausted_history) < MAX_IP_EXHAUSTED_COUNT:
+        return False
+    
+    ten_minutes_ago = current_time - 10 * 60
+    recent_exhausted = [h for h in ip_exhausted_history if h['time'] >= ten_minutes_ago]
+    
+    if len(recent_exhausted) >= MAX_IP_EXHAUSTED_COUNT:
+        gui_print(f"")
+        gui_print(f"{'!'*60}")
+        gui_print(f"[严重警告] 高峰期检测到 IP库频繁耗尽！")
+        gui_print(f"{'='*60}")
+        gui_print(f"IP耗尽历史详情:")
+        for i, hist in enumerate(recent_exhausted, 1):
+            dt = datetime.fromtimestamp(hist['time']).strftime('%H:%M:%S')
+            gui_print(f"  {i}. {dt} - IP库已耗尽")
+        gui_print(f"{'='*60}")
+        
+        current_colo = current_args.colo if current_args else DEFAULT_CONFIG['colo']
+        current_delay = current_args.delay if current_args else DEFAULT_CONFIG['delay']
+        
+        if downgrade_attempt_count == 0:
+            new_delay = min(current_delay + 100, 300)
+            new_colo = get_next_downgrade_colo(current_colo) if new_delay == 300 else current_colo
+            
+            gui_print(f"")
+            gui_print(f"[自动降级] 第一次触发IP库频繁耗尽，将自动降级重试")
+            gui_print(f"[降级方案] 机房: {current_colo} → {new_colo}, 延迟: {current_delay}ms → {new_delay}ms")
+            gui_print(f"[等待] 15秒后重新启动...")
+            
+            if cfnat_proc:
+                cfnat_proc.terminate()
+            
+            downgrade_attempt_count += 1
+            last_used_colos.append(current_colo)
+            
+            time.sleep(15)
+            
+            gui_print(f"")
+            gui_print(f"[重启] 使用降级方案重新启动...")
+            ip_exhausted_history = []
+            auto_switch_history = []
+            auto_switch_start_time = 0
+            current_ip = None
+            
+            if current_args:
+                current_args.colo = new_colo
+                current_args.delay = new_delay
+                if gui_app:
+                    gui_app.colo_var.set(new_colo)
+                    gui_app.delay_var.set(str(new_delay))
+            
+            return 'retry'
+        else:
+            gui_print(f"")
+            gui_print(f"{'!'*60}")
+            gui_print(f"[严重警告] 已自动降级重试1次，再次触发IP库频繁耗尽！")
+            gui_print(f"[提示] 请手动检查日志后再判断下一步操作")
+            gui_print(f"{'!'*60}")
+            
+            if cfnat_proc:
+                cfnat_proc.terminate()
+                gui_print("[操作] cfnat 进程已关闭。")
+            
+            running = False
+            return True
+    
+    return False
+
+
+def check_ip_exhausted_cli():
+    global ip_exhausted_history, cfnat_proc, running, current_args, downgrade_attempt_count, last_used_colos, auto_switch_history, auto_switch_start_time, current_ip
+    
+    if not is_rush_hour():
+        return False
+    
+    current_time = time.time()
+    
+    # 防止同一秒内重复记录（如果最近1秒内已记录，则跳过）
+    if ip_exhausted_history:
+        last_time = ip_exhausted_history[-1]['time']
+        if current_time - last_time < 1:
+            return False
+    
+    ip_exhausted_history.append({'time': current_time})
+    
+    if len(ip_exhausted_history) < MAX_IP_EXHAUSTED_COUNT:
+        return False
+    
+    ten_minutes_ago = current_time - 10 * 60
+    recent_exhausted = [h for h in ip_exhausted_history if h['time'] >= ten_minutes_ago]
+    
+    if len(recent_exhausted) >= MAX_IP_EXHAUSTED_COUNT:
+        print(f"\n{'!'*60}")
+        print("[严重警告] 高峰期检测到 IP库频繁耗尽！")
+        print(f"{'='*60}")
+        print(f"IP耗尽历史详情:")
+        for i, hist in enumerate(recent_exhausted, 1):
+            dt = datetime.fromtimestamp(hist['time']).strftime('%H:%M:%S')
+            print(f"  {i}. {dt} - IP库已耗尽")
+        print(f"{'='*60}")
+        
+        current_colo = current_args.colo if current_args else DEFAULT_CONFIG['colo']
+        current_delay = current_args.delay if current_args else DEFAULT_CONFIG['delay']
+        
+        if downgrade_attempt_count == 0:
+            new_delay = min(current_delay + 100, 300)
+            new_colo = get_next_downgrade_colo(current_colo) if new_delay == 300 else current_colo
+            
+            print(f"\n[自动降级] 第一次触发IP库频繁耗尽，将自动降级重试")
+            print(f"[降级方案] 机房: {current_colo} → {new_colo}, 延迟: {current_delay}ms → {new_delay}ms")
+            print(f"[等待] 15秒后重新启动...")
+            
+            if cfnat_proc:
+                cfnat_proc.terminate()
+            
+            downgrade_attempt_count += 1
+            last_used_colos.append(current_colo)
+            
+            time.sleep(15)
+            
+            print(f"\n[重启] 使用降级方案重新启动...")
+            ip_exhausted_history = []
+            auto_switch_history = []
+            auto_switch_start_time = 0
+            current_ip = None
+            
+            if current_args:
+                current_args.colo = new_colo
+                current_args.delay = new_delay
+            
+            return 'retry'
+        else:
+            print(f"\n{'!'*60}")
+            print("[严重警告] 已自动降级重试1次，再次触发IP库频繁耗尽！")
+            print("[提示] 请手动检查日志后再判断下一步操作")
+            print(f"{'!'*60}\n")
+            
+            if cfnat_proc:
+                cfnat_proc.terminate()
+                print("[操作] cfnat 进程已关闭。")
+            
+            running = False
+            return True
+    
+    return False
+
+
+def update_ip_refresh_count(ip, delay=None):
+    """
+    更新IP刷新次数和延迟
+    ip: IP地址
+    delay: 延迟ms（可选）
+    """
+    global ip_refresh_counts, ip_delays
+    if ip in ip_refresh_counts:
+        ip_refresh_counts[ip] += 1
+    else:
+        ip_refresh_counts[ip] = 1
+    if delay is not None:
+        ip_delays[ip] = int(delay)
+    return ip_refresh_counts[ip]
+
+
+def write_subscription_content(content):
+    """
+    将订阅内容写入缓存文件。
+    返回: (是否成功, 错误对象)
+    """
+    sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
+    try:
+        with open(sub_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True, None
+    except Exception as e:
+        return False, e
+
+
+def commit_subscription_update(target_ip, cli_mode=False):
+    """
+    先生成订阅内容并写盘，成功后才提交 subscription_ip，避免状态与文件不一致。
+    返回: (是否成功, 旧订阅IP, 错误对象)
+    """
+    global subscription_ip
+
+    old_sub_ip = subscription_ip
+    generator = generate_subscription_cli if cli_mode else generate_subscription
+    content = generator([target_ip], silent=True)
+    if not content:
+        return False, old_sub_ip, RuntimeError("generated subscription content is empty")
+
+    ok, err = write_subscription_content(content)
+    if not ok:
+        return False, old_sub_ip, err
+
+    subscription_ip = target_ip
+    return True, old_sub_ip, None
+
+
+def update_subscription_if_needed():
+    """
+    检查并更新订阅IP
+    策略：IP切换后，等待新IP刷新10次才切换订阅并锁定
+    返回: (是否更新了, 当前IP, 旧订阅IP)
+    """
+    global subscription_ip, ip_refresh_counts, subscription_locked, current_ip
+    
+    # 如果订阅已锁定，不再更新
+    if subscription_locked:
+        return (False, subscription_ip, None)
+    
+    # 优先使用当前cfnat选定的IP
+    target_ip = current_ip
+    
+    if target_ip is None:
+        return (False, None, None)
+    
+    # 检查当前IP的刷新次数
+    current_refresh_count = ip_refresh_counts.get(target_ip, 0)
+    
+    if target_ip == subscription_ip:
+        # 当前IP已经是订阅IP，检查是否达到锁定阈值
+        if current_refresh_count >= SUBSCRIPTION_LOCK_THRESHOLD:
+            subscription_locked = True
+            return (False, target_ip, None)
+        return (False, target_ip, None)
+    
+    # 当前IP与订阅IP不同
+    # 只有在新IP刷新次数达到阈值后才切换订阅
+    if current_refresh_count >= SUBSCRIPTION_LOCK_THRESHOLD:
+        # 真正切换要等订阅文件写入成功后再提交
+        return (True, target_ip, subscription_ip)
+    
+    # 新IP刷新次数不足，不切换订阅
+    return (False, target_ip, None)
+
+
+def should_show_log():
+    """
+    判断是否应该显示日志（基于LOG_REFRESH_INTERVAL）
+    返回: True-应该显示，False-不应该显示
+    """
+    global last_log_time
+    current_time = time.time()
+    if current_time - last_log_time >= LOG_REFRESH_INTERVAL:
+        last_log_time = current_time
+        return True
+    return False
+
+
+def get_location_code(city_name):
+    global LOCATION_CACHE
+    
+    if city_name in LOCATION_CACHE:
+        return LOCATION_CACHE[city_name]
+    
+    if LOCATION_DATA:
+        city_lower = city_name.lower()
+        for loc in LOCATION_DATA:
+            if loc.get('city', '').lower() == city_lower:
+                code = loc.get('iata', '---')
+                LOCATION_CACHE[city_name] = code
+                save_location_cache()
+                return code
+    
+    LOCATION_CACHE[city_name] = '---'
+    save_location_cache()
+    return '---'
+
+
+def parse_vless_url(url):
+    try:
+        match = re.match(r'vless://([^@]+)@([^:]+):(\d+)\?(.*)#(.*)', url)
+        if not match:
+            return None
+        uuid, ip, port, params, name = match.groups()
+        return {
+            'type': 'vless',
+            'uuid': uuid,
+            'ip': ip,
+            'port': int(port),
+            'params': params,
+            'name': name
+        }
+    except:
+        return None
+
+
+def build_vless_url(node):
+    return f"vless://{node['uuid']}@{node['ip']}:{node['port']}?{node['params']}#{node['name']}"
+
+
+def parse_vmess_url(url):
+    try:
+        if not url.startswith('vmess://'):
+            return None
+        b64_data = url[8:]
+        b64_data += '=' * (4 - len(b64_data) % 4)
+        json_str = base64.b64decode(b64_data).decode('utf-8')
+        data = json.loads(json_str)
+        return {
+            'type': 'vmess',
+            'data': data
+        }
+    except:
+        return None
+
+
+def build_vmess_url(node):
+    json_str = json.dumps(node['data'], ensure_ascii=False)
+    b64_data = base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
+    return f"vmess://{b64_data}"
+
+
+def normalize_speedtest_url(test_url):
+    return test_url.replace(
+        "speed.cloudflare.com/__down?bytes=100000000",
+        "speed.cloudflare.com/__down?bytes=10000000"
+    ).replace(
+        "speed.cloudflare.com/__down?bytes=50000000",
+        "speed.cloudflare.com/__down?bytes=10000000"
+    )
+
+
+def load_cached_subscription_content():
+    sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
+    if not os.path.exists(sub_path):
+        return ""
+    try:
+        with open(sub_path, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def decode_subscription_lines(content):
+    if not content:
+        return []
+    try:
+        decoded = base64.b64decode(content).decode('utf-8')
+    except Exception:
+        return []
+    return [line.strip() for line in decoded.splitlines() if line.strip()]
+
+
+def parse_subscription_nodes(content):
+    nodes = []
+    for line in decode_subscription_lines(content):
+        node = None
+        if line.startswith('vless://'):
+            node = parse_vless_url(line)
+        elif line.startswith('vmess://'):
+            node = parse_vmess_url(line)
+        if node:
+            node['raw'] = line
+            nodes.append(node)
+    return nodes
+
+
+def get_node_ip(node):
+    if node['type'] == 'vless':
+        return node.get('ip', '')
+    if node['type'] == 'vmess':
+        return str(node.get('data', {}).get('add', '')).strip()
+    return ''
+
+
+def get_node_port(node):
+    if node['type'] == 'vless':
+        return int(node.get('port', 0) or 0)
+    if node['type'] == 'vmess':
+        return int(node.get('data', {}).get('port', 0) or 0)
+    return 0
+
+
+def get_subscription_speedtest_target():
+    target_ip = subscription_ip or load_subscription_ip_from_cache()
+    if not target_ip:
+        return None, "当前没有可测速的订阅IP"
+
+    cached_content = load_cached_subscription_content()
+    nodes = parse_subscription_nodes(cached_content)
+    if not nodes:
+        nodes = parse_subscription_nodes(generate_subscription([target_ip], silent=True))
+
+    for node in nodes:
+        node_ip = get_node_ip(node)
+        node_port = get_node_port(node)
+        if node_ip == target_ip and node_port > 0:
+            return {
+                'ip': target_ip,
+                'port': node_port,
+                'scheme': 'https' if node_port in TLS_PORTS else 'http'
+            }, None
+
+    return {
+        'ip': target_ip,
+        'port': 443,
+        'scheme': 'https'
+    }, None
+
+
+def open_speedtest_stream(target_ip, target_port, scheme):
+    test_url = SPEEDTEST_URL
+    if not test_url.startswith('http://') and not test_url.startswith('https://'):
+        test_url = scheme + '://' + test_url
+    test_url = normalize_speedtest_url(test_url)
+
+    parsed = urlparse(test_url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise RuntimeError("测速地址解析失败")
+
+    path = parsed.path or '/'
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    sock = socket.create_connection((target_ip, target_port), timeout=SPEEDTEST_CONNECT_TIMEOUT)
+    sock.settimeout(SPEEDTEST_READ_TIMEOUT)
+
+    conn = sock
+    if scheme == 'https':
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        conn = context.wrap_socket(sock, server_hostname=hostname)
+        conn.settimeout(SPEEDTEST_READ_TIMEOUT)
+
+    request_data = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {hostname}\r\n"
+        "User-Agent: Mozilla/5.0\r\n"
+        "Accept: */*\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode('ascii')
+    conn.sendall(request_data)
+
+    response = b''
+    while b'\r\n\r\n' not in response:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+        if len(response) > 65536:
+            break
+
+    if b'\r\n\r\n' not in response:
+        conn.close()
+        raise RuntimeError("测速响应头读取失败")
+
+    header, body = response.split(b'\r\n\r\n', 1)
+    status_line = header.split(b'\r\n', 1)[0].decode('iso-8859-1', errors='ignore')
+    parts = status_line.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        conn.close()
+        raise RuntimeError("测速响应状态异常")
+
+    status_code = int(parts[1])
+    if status_code != 200:
+        conn.close()
+        raise RuntimeError(f"测速返回 HTTP {status_code}")
+
+    return conn, len(body)
+
+
+def run_subscription_speedtest(target_ip, target_port, scheme):
+    start = time.time()
+    conn, initial_body_bytes = open_speedtest_stream(target_ip, target_port, scheme)
+    total_bytes = int(initial_body_bytes)
+    max_speed = 0.0
+    window_bytes = int(initial_body_bytes)
+    window_start = start
+    deadline = start + SPEEDTEST_DURATION
+
+    try:
+        while time.time() < deadline:
+            now = time.time()
+            if window_bytes > 0 and now - window_start >= SPEEDTEST_WINDOW:
+                current_speed = float(window_bytes) / (now - window_start) / 1024 / 1024
+                if current_speed > max_speed:
+                    max_speed = current_speed
+                window_bytes = 0
+                window_start = now
+
+            try:
+                chunk = conn.recv(32 * 1024)
+            except socket.timeout:
+                break
+
+            now = time.time()
+            if not chunk:
+                break
+
+            read_bytes = len(chunk)
+            total_bytes += read_bytes
+            window_bytes += read_bytes
+
+            if window_bytes > 0 and now - window_start >= SPEEDTEST_WINDOW:
+                current_speed = float(window_bytes) / (now - window_start) / 1024 / 1024
+                if current_speed > max_speed:
+                    max_speed = current_speed
+                window_bytes = 0
+                window_start = now
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if window_bytes > 0:
+        window_duration = max(time.time() - window_start, 0.001)
+        current_speed = float(window_bytes) / window_duration / 1024 / 1024
+        if current_speed > max_speed:
+            max_speed = current_speed
+
+    if max_speed == 0 and total_bytes > 0:
+        total_duration = max(time.time() - start, 0.001)
+        max_speed = float(total_bytes) / total_duration / 1024 / 1024
+
+    return f"{max_speed:.2f} MB/s"
+
+
+def load_template():
+    global current_template
+    if current_template:
+        template_path = current_template
+    else:
+        template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), NODES_FILE)
+    
+    if not os.path.exists(template_path):
+        gui_print(f"[错误] 找不到模板文件: {template_path}")
+        return []
+    
+    nodes = []
+    with open(template_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('vless://'):
+                node = parse_vless_url(line)
+                if node:
+                    node['raw'] = line
+                    nodes.append(node)
+            elif line.startswith('vmess://'):
+                node = parse_vmess_url(line)
+                if node:
+                    node['raw'] = line
+                    nodes.append(node)
+    return nodes
+
+
+def replace_node_ip(node, new_ip, idx=None):
+    if node['type'] == 'vless':
+        if node['port'] == 443:
+            new_node = node.copy()
+            new_node['ip'] = new_ip
+            return new_node
+        return node
+    elif node['type'] == 'vmess':
+        port = int(node['data'].get('port', 0))
+        if port == 443:
+            new_node = {'type': 'vmess', 'data': node['data'].copy()}
+            new_node['data']['add'] = new_ip
+            return new_node
+        return node
+    return node
+
+
+def check_ip_switch_too_frequent(new_ip):
+    global auto_switch_history, cfnat_proc, running, auto_switch_start_time, downgrade_attempt_count, last_used_colos, current_args
+
+    if is_rush_hour():
+        return False
+
+    current_time = time.time()
+    
+    validity_minutes = 0
+    if auto_switch_start_time > 0:
+        validity_minutes = (current_time - auto_switch_start_time) / 60
+    
+    auto_switch_start_time = current_time
+    auto_switch_history.append({'time': current_time, 'ip': new_ip, 'validity': validity_minutes})
+
+    if len(auto_switch_history) < MAX_SHORT_VALIDITY_COUNT + 1:
+        return False
+
+    recent_switches = auto_switch_history[-(MAX_SHORT_VALIDITY_COUNT + 1):]
+    intervals = []
+    for i in range(1, len(recent_switches)):
+        interval_minutes = (recent_switches[i]['time'] - recent_switches[i-1]['time']) / 60
+        intervals.append(interval_minutes)
+
+    short_interval_count = sum(1 for interval in intervals if interval < MIN_VALIDITY_MINUTES)
+
+    if short_interval_count >= MAX_SHORT_VALIDITY_COUNT:
+        gui_print(f"")
+        gui_print(f"{'!'*60}")
+        gui_print(f"[严重警告] 检测到 IP 频繁切换！")
+        gui_print(f"{'='*60}")
+        gui_print(f"切换历史详情:")
+        for i, switch in enumerate(recent_switches, 1):
+            dt = datetime.fromtimestamp(switch['time']).strftime('%H:%M:%S')
+            gui_print(f"  {i}. {dt} - IP: {switch['ip']} - 有效期: {switch['validity']:.1f}分钟")
+        gui_print(f"")
+        gui_print(f"切换间隔:")
+        for i, interval in enumerate(intervals, 1):
+            status = "⚠️ 小于10分钟" if interval < MIN_VALIDITY_MINUTES else "✅ 正常"
+            gui_print(f"  第{i}次间隔: {interval:.1f}分钟 - {status}")
+        gui_print(f"{'='*60}")
+        
+        gui_print(f"")
+        gui_print(f"{'!'*60}")
+        gui_print(f"[严重警告] 检测到 IP 频繁切换！")
+        gui_print(f"[提示] 请手动检查日志后再判断下一步操作")
+        gui_print(f"{'!'*60}")
+        
+        if cfnat_proc:
+            cfnat_proc.terminate()
+            gui_print("[操作] cfnat 进程已关闭。")
+        
+        running = False
+        return True
+
+    return False
+
+
+def generate_subscription(ips=None, sort_by_delay=True, silent=False):
+    template_nodes = load_template()
+    if not template_nodes:
+        return ""
+    
+    use_ips = []
+    
+    if ips:
+        use_ips = ips
+    elif current_ip:
+        use_ips = [current_ip]
+    else:
+        sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
+        if os.path.exists(sub_path):
+            try:
+                with open(sub_path, 'r', encoding='utf-8') as f:
+                    cached_content = f.read().strip()
+                    if cached_content:
+                        if not silent:
+                            gui_print(f"[订阅文件] 使用缓存内容: {SUBSCRIPTION_FILE}")
+                        return cached_content
+            except:
+                pass
+        return base64.b64encode('\n'.join([n['raw'] for n in template_nodes]).encode()).decode()
+    
+    ip_index = 0
+    result_lines = []
+    for node in template_nodes:
+        if node['type'] == 'vless' and node['port'] == 443:
+            new_ip = use_ips[ip_index % len(use_ips)]
+            new_node = replace_node_ip(node, new_ip, ip_index + 1)
+            result_lines.append(build_vless_url(new_node))
+            ip_index += 1
+        elif node['type'] == 'vmess' and int(node['data'].get('port', 0)) == 443:
+            new_ip = use_ips[ip_index % len(use_ips)]
+            new_node = replace_node_ip(node, new_ip, ip_index + 1)
+            result_lines.append(build_vmess_url(new_node))
+            ip_index += 1
+        else:
+            if node['type'] == 'vless':
+                result_lines.append(build_vless_url(node))
+            elif node['type'] == 'vmess':
+                result_lines.append(build_vmess_url(node))
+    
+    result = base64.b64encode('\n'.join(result_lines).encode()).decode()
+    
+    if not silent:
+        try:
+            ok, err = write_subscription_content(result)
+            if not ok:
+                raise err
+            if ips and len(ips) == 1:
+                gui_print(f"[订阅文件] 已更新为当前IP: {ips[0]}")
+            else:
+                gui_print(f"[订阅文件] 已更新: {SUBSCRIPTION_FILE}")
+        except Exception as e:
+            gui_print(f"[错误] 写入订阅文件失败: {e}")
+    
+    return result
+
+
+class SubHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+    
+    def do_GET(self):
+        if self.path == SUB_PATH or self.path == '/':
+            if subscription_ip:
+                sub_content = generate_subscription([subscription_ip], silent=True)
+            elif current_ip:
+                sub_content = generate_subscription([current_ip], silent=True)
+            else:
+                sub_content = generate_subscription(silent=True)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', len(sub_content))
+            self.end_headers()
+            self.wfile.write(sub_content.encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def diagnose_port(port):
+    """诊断端口占用情况，返回排查提示"""
+    try:
+        import subprocess as sp, socket
+        host = socket.gethostname()
+        result = sp.run(['netstat', '-ano'], capture_output=True, text=True, creationflags=sp.CREATE_NO_WINDOW)
+        lines = result.stdout.splitlines()
+        port_str = f":{port}"
+        pid_set = set()
+        for line in lines:
+            if port_str in line and ('LISTENING' in line or 'ESTABLISHED' in line or 'TIME_WAIT' in line or 'CLOSE_WAIT' in line):
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    pid_set.add(parts[-1])
+        hints = []
+        if pid_set:
+            for pid in sorted(pid_set):
+                try:
+                    proc = sp.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'], capture_output=True, text=True, creationflags=sp.CREATE_NO_WINDOW)
+                    proc_name = proc.stdout.strip().split()[-3] if proc.stdout.strip() else '?'
+                    hints.append(f"  PID {pid} ({proc_name})")
+                except:
+                    hints.append(f"  PID {pid}")
+        msg = f"[端口诊断] 端口 {port} 被以下进程占用:\n" + "\n".join(hints) if hints else f"[端口诊断] 端口 {port} 可能处于 TIME_WAIT 状态（上次未完全释放）"
+        msg += "\n[排查方法] 1) 任务管理器结束残留进程  2) `netstat -ano|findstr :8888` 查看占用  3) 等待2分钟或换端口"
+        return msg
+    except:
+        return f"[端口诊断] 请尝试: 1) `netstat -ano | findstr :{port}` 查看占用  2) 结束占用进程  3) 更换端口"
+
+
+def start_http_server(port):
+    global http_server, http_server_port, http_server_starting
+    try:
+        server = socketserver.TCPServer(('0.0.0.0', port), SubHandler)
+        server.allow_reuse_address = True
+        with http_server_lock:
+            http_server = server
+            http_server_port = port
+            http_server_starting = False
+        local_ip = get_local_ip()
+        gui_print(f"")
+        gui_print(f"{'='*60}")
+        gui_print(f"[订阅服务] 已启动")
+        gui_print(f"{'='*60}")
+        gui_print(f"  本地访问:   http://127.0.0.1:{port}{SUB_PATH}")
+        gui_print(f"  局域网访问: http://{local_ip}:{port}{SUB_PATH}")
+        gui_print(f"{'='*60}")
+        gui_print(f"[提示] 将上述地址复制到代理客户端的订阅地址栏即可使用")
+        gui_print(f"[提示] 订阅内容会随 IP 优选自动更新，无需手动刷新")
+        gui_print(f"{'='*60}")
+        gui_print(f"")
+        server.serve_forever()
+    except OSError as e:
+        with http_server_lock:
+            if http_server is None:
+                http_server_port = None
+            http_server_starting = False
+        gui_print(f"[错误] 启动HTTP服务失败: {e}")
+        gui_print(diagnose_port(port))
+    except Exception as e:
+        with http_server_lock:
+            if http_server is None:
+                http_server_port = None
+            http_server_starting = False
+        gui_print(f"[错误] 启动HTTP服务失败: {e}")
+    finally:
+        with http_server_lock:
+            server_ref = http_server
+            http_server = None
+            http_server_port = None
+            http_server_starting = False
+        if server_ref:
+            try:
+                server_ref.server_close()
+            except:
+                pass
+
+
+def ensure_subscription_service_running(port):
+    global http_server, http_server_port, http_server_starting
+
+    need_start = False
+    with http_server_lock:
+        if http_server:
+            if http_server_port and http_server_port != port:
+                gui_print(f"[订阅服务] 已在端口 {http_server_port} 运行，请先停止后再切换端口 {port}")
+                return False
+            gui_print(f"[订阅服务] 已在运行中，继续使用现有服务")
+        elif http_server_starting:
+            gui_print(f"[订阅服务] 正在启动中，请稍候...")
+        else:
+            http_server_starting = True
+            http_server_port = port
+            need_start = True
+
+    if need_start:
+        threading.Thread(target=start_http_server, args=(port,), daemon=True).start()
+
+    for _ in range(20):
+        with http_server_lock:
+            if http_server:
+                break
+            still_starting = http_server_starting
+        if not still_starting:
+            break
+        time.sleep(0.1)
+
+    with http_server_lock:
+        service_ready = http_server is not None
+    if not service_ready:
+        gui_print(f"[错误] 订阅服务启动失败，请稍后重试")
+        return False
+
+    cached_content = load_cached_subscription_content()
+    if cached_content:
+        gui_print(f"[订阅文件] 使用缓存内容: {SUBSCRIPTION_FILE}")
+    return True
+
+
+def cfnat_worker(args):
+    global captured_ips, captured_data, cfnat_proc, running, location_stats, auto_switch_start_time, auto_switch_history
+    global scan_start_time, current_ip, ip_refresh_counts, subscription_ip, last_refresh_ip, ip_exhausted_history
+    global ip_delays, last_log_time, valid_ip_count, subscription_locked
+    
+    while running:
+        location_stats = {}
+        captured_ips = []
+        captured_data = []
+        ip_refresh_counts = {}
+        ip_delays = {}
+        # 不再重置 subscription_ip，保留上一轮的历史订阅IP
+        # 新扫描开始时解锁订阅，允许新IP在达到10次后切换
+        subscription_locked = False
+        if subscription_ip:
+            gui_print(f"[新扫描] 保留历史订阅IP: {subscription_ip}")
+        else:
+            gui_print(f"[新扫描] 无历史订阅IP")
+        last_refresh_ip = None
+        ip_exhausted_history = []
+        last_log_time = 0
+        valid_ip_count = 0
+        
+        cfnat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CFNAT_BIN)
+        if not os.path.exists(cfnat_path):
+            gui_print(f"[错误] 找不到 cfnat 程序: {cfnat_path}")
+            return
+        
+        use_args = current_args if current_args else args
+        cmd = [
+            cfnat_path,
+            '-ips', '4',
+            '-addr', '127.0.0.1:1234',
+            '-colo', use_args.colo,
+            '-random=true',
+            '-delay', str(use_args.delay),
+            '-task', str(use_args.task),
+            '-num', str(use_args.num),
+            '-ipnum', str(use_args.ipnum),
+            '-port', '443',
+            '-tls=true'
+        ]
+        
+        gui_print(f"[cfnat] 启动参数: {' '.join(cmd)}")
+        gui_print(f"[cfnat] 正在扫描优选 IP，请耐心等待...")
+        gui_print(f"")
+        
+        valid_ip_pattern = re.compile(r'发现有效IP\s+(\d{1,3}(?:\.\d{1,3}){3})\s+位置信息\s+(.+?)\s+延迟\s+(\d+)\s+毫秒')
+        best_conn_pattern = re.compile(r'选择最佳连接[:：]\s*地址[:：]\s*(\d{1,3}(?:\.\d{1,3}){3}):(\d+)\s*延迟[:：]\s*(\d+)\s*ms')
+        progress_pattern = re.compile(r'已完成:\s*(\d+)\s+总数:\s*(\d+)')
+        listen_pattern = re.compile(r'正在监听\s+(\S+)')
+        validity_start_pattern = re.compile(r'开始状态检查')
+        valid_conn_pattern = re.compile(r'符合要求的连接[:：]?')
+        no_valid_pattern = re.compile(r'未找到符合延迟要求的连接')
+        switch_ip_pattern = re.compile(r'切换到新的有效 IP[:：]\s*(\d{1,3}(?:\.\d{1,3}){3})')
+        all_ip_exhausted_pattern = re.compile(r'所有 IP 都已检查过|所有 IP 都已用尽')
+        scan_complete_pattern = re.compile(r'成功提取\s+(\d+)\s+个有效IP')
+        rescan_pattern = re.compile(r'主函数将退出当前循环')
+        fail_check_pattern = re.compile(r'状态检查失败|连续两次状态检查失败')
+        
+        validity_started = False
+        last_best_ip = None
+        last_progress_pct = -1
+        last_progress_line = ""
+        last_refresh_line = ""
+        scan_start_time = time.time()
+        ip_exhausted_logged = False  # 本轮扫描是否已记录过IP耗尽
+        
+        try:
+            creationflags = 0
+            if sys.platform == 'win32':
+                creationflags = 0x08000000
+            
+            cfnat_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=creationflags
+            )
+            
+            for line in iter(cfnat_proc.stdout.readline, ''):
+                if not running:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 保存原始cfnat日志
+                write_cfnat_log(line)
+                
+                listen_match = listen_pattern.search(line)
+                if listen_match:
+                    continue
+                
+                if validity_start_pattern.search(line):
+                    if not validity_started:
+                        validity_started = True
+                        ip_exhausted_logged = False  # 进入优选模式时重置IP耗尽记录标志
+                        gui_print(f"")
+                        gui_print(f"{'='*60}")
+                        gui_print(f"[优选模式] 扫描完成，进入IP优选阶段")
+                        gui_print(f"{'='*60}")
+                        if location_stats:
+                            save_location_stats(location_stats)
+                            gui_print(f"")
+                            gui_print(f"[扫描统计] 各机场 IP 分布 (≥10个):")
+                            gui_print(f"{'-'*60}")
+                            gui_print(f"{'机场名称':<16} {'代码':<8} {'数量':>6} {'平均延迟':>10}")
+                            gui_print(f"{'-'*60}")
+                            sorted_stats = sorted(location_stats.items(), key=lambda x: x[1]['count'], reverse=True)
+                            total = 0
+                            other_count = 0
+                            for loc, stats in sorted_stats:
+                                count = stats['count']
+                                if count < 10:
+                                    other_count += count
+                                    continue
+                                code = get_location_code(loc)
+                                avg_delay = (stats['min_delay'] + stats['max_delay']) // 2
+                                gui_print(f"{loc:<16} {code:<8} {count:>6} {avg_delay:>9}ms")
+                                total += count
+                            if other_count > 0:
+                                gui_print(f"{'其他':<16} {'':<8} {other_count:>6}")
+                            gui_print(f"{'-'*60}")
+                            gui_print(f"{'总计':<16} {'':<8} {total + other_count:>6}")
+                            gui_print(f"{'-'*60}")
+                            gui_print(f"")
+                            if gui_app:
+                                gui_app.root.after(0, gui_app.update_defaults)
+                        
+                        gui_print(f"[扫描发现] 共发现 {valid_ip_count} 个有效IP")
+                        gui_print(f"[订阅地址] http://127.0.0.1:{args.port}/sub")
+                        gui_print(f"[等待优选] 等待cfnat选出最佳IP...")
+                        
+                        if captured_ips:
+                            current_ip = captured_ips[0]
+                            auto_switch_history = []
+                            auto_switch_start_time = 0
+                            last_best_ip = None
+                    continue
+                
+                progress_match = progress_pattern.search(line)
+                if progress_match and not validity_started:
+                    done, total = progress_match.groups()
+                    done_int = int(done)
+                    total_int = int(total)
+                    pct = float(done_int) / float(total_int) * 100 if total_int > 0 else 0
+                    pct_int = int(pct)
+                    if pct_int != last_progress_pct and pct_int % 5 == 0:
+                        last_progress_pct = pct_int
+                        ip_count = len(captured_ips)
+                        elapsed = time.time() - scan_start_time
+                        speed = done_int / elapsed if elapsed > 0 else 0
+                        remaining = (total_int - done_int) / speed if speed > 0 else 0
+                        progress_line = f"[扫描] {pct_int}% | {ip_count}个IP | {int(speed)}/秒 | 剩余{int(remaining)}秒"
+                        gui_print_refresh(progress_line)
+                        last_progress_line = progress_line
+                    continue
+                
+                if valid_conn_pattern.search(line):
+                    continue
+                
+                if no_valid_pattern.search(line):
+                    if not validity_started:
+                        gui_print(f"[警告] 未找到符合延迟要求的连接，等待下一次检测...")
+                    continue
+                
+                if fail_check_pattern.search(line):
+                    if '连续两次' in line:
+                        gui_print(f"[状态] 连续失败，切换IP...")
+                    continue
+                
+                if all_ip_exhausted_pattern.search(line):
+                    # 防止同一轮扫描重复记录IP耗尽
+                    if not ip_exhausted_logged:
+                        ip_exhausted_logged = True
+                        gui_print(f"")
+                        gui_print(f"[IP耗尽] 将重新扫描...")
+                        check_result = check_ip_exhausted()
+                        if check_result == 'retry':
+                            continue
+                        elif check_result:
+                            running = False
+                            break
+                    validity_started = False
+                    continue
+                
+                scan_complete_match = scan_complete_pattern.search(line)
+                if scan_complete_match:
+                    count = scan_complete_match.group(1)
+                    valid_ip_count = int(count)
+                    gui_print(f"")
+                    gui_print(f"[扫描完成] 找到 {count} 个有效IP")
+                    continue
+                
+                if rescan_pattern.search(line):
+                    gui_print(f"")
+                    gui_print(f"[重新扫描] 开始...")
+                    validity_started = False
+                    continue
+                
+                switch_match = switch_ip_pattern.search(line)
+                if switch_match:
+                    new_ip = switch_match.group(1)
+                    
+                    if new_ip != current_ip:
+                        old_ip = current_ip
+                        current_ip = new_ip
+                        if check_ip_switch_too_frequent(new_ip):
+                            running = False
+                            break
+                        
+                        refresh_count = update_ip_refresh_count(new_ip)
+                        if should_show_log():
+                            old_count = ip_refresh_counts.get(old_ip, 0) if old_ip else 0
+                            current_delay = ip_delays.get(new_ip, '---')
+                            refresh_line = f"[IP切换] {old_ip or '---'} → {new_ip} | 延迟: {current_delay}ms | 刷新次数: {refresh_count}"
+                            gui_print_refresh(refresh_line)
+                            last_refresh_line = refresh_line
+                        
+                        # 显示当前cfnat使用的IP信息和订阅状态
+                        if current_ip:
+                            current_refresh_count = ip_refresh_counts.get(current_ip, 0)
+                            current_delay_val = ip_delays.get(current_ip, '---')
+                            gui_print(f"")
+                            gui_print(f"[当前使用] IP: {current_ip} | 延迟 {current_delay_val}ms | 刷新次数 {current_refresh_count}")
+                            # 显示当前订阅IP（可能与current_ip不同）
+                            if subscription_ip:
+                                sub_delay = ip_delays.get(subscription_ip, '---')
+                                sub_count = ip_refresh_counts.get(subscription_ip, 0)
+                                if subscription_ip == current_ip:
+                                    # 当前IP就是订阅IP
+                                    if sub_count >= SUBSCRIPTION_LOCK_THRESHOLD:
+                                        gui_print(f"[订阅IP] {subscription_ip} | 延迟 {sub_delay}ms | 刷新 {sub_count}次 | 当前最优")
+                                    else:
+                                        remaining = SUBSCRIPTION_LOCK_THRESHOLD - sub_count
+                                        gui_print(f"[订阅IP] {subscription_ip} | 延迟 {sub_delay}ms | 刷新 {sub_count}次 | 还需{remaining}次稳定")
+                                else:
+                                    # 当前使用IP与订阅IP不同，显示新IP还需多少次才切换
+                                    remaining = SUBSCRIPTION_LOCK_THRESHOLD - current_refresh_count
+                                    if remaining > 0:
+                                        gui_print(f"[候选IP] {current_ip} | 延迟 {current_delay_val}ms | 刷新 {current_refresh_count}次 | 还需{remaining}次可切换订阅")
+                                    else:
+                                        gui_print(f"[候选IP] {current_ip} | 延迟 {current_delay_val}ms | 刷新 {current_refresh_count}次 | 即将切换订阅")
+                                    # 当前订阅IP
+                                    count_str = f"本轮{sub_count}次" if sub_count > 0 else "历史订阅"
+                                    gui_print(f"[订阅IP] {subscription_ip} | 延迟 {sub_delay}ms | {count_str}")
+                            else:
+                                # 首次运行，无历史订阅IP
+                                remaining = SUBSCRIPTION_LOCK_THRESHOLD - current_refresh_count
+                                if remaining > 0:
+                                    gui_print(f"[订阅状态] 等待首次优选（还需{remaining}次刷新）")
+                        
+                        update_result = update_subscription_if_needed()
+                        if update_result[0]:
+                            new_sub_ip = update_result[1]
+                            switched, old_sub_ip, err = commit_subscription_update(new_sub_ip, cli_mode=False)
+                            gui_print(f"")
+                            if switched:
+                                gui_print(f"[订阅文件] 已更新为当前IP: {new_sub_ip}")
+                                if old_sub_ip:
+                                    old_count = ip_refresh_counts.get(old_sub_ip, 0)
+                                    new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                    gui_print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {new_sub_ip}({new_count}次)")
+                                else:
+                                    new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                    new_delay = ip_delays.get(new_sub_ip, '---')
+                                    gui_print(f"[订阅更新] ✓ 首次订阅IP: {new_sub_ip} | 延迟 {new_delay}ms | 刷新次数 {new_count}")
+                            else:
+                                gui_print(f"[订阅更新] × 写入订阅文件失败，保持原订阅IP: {old_sub_ip or '---'} | 错误: {err}")
+                    continue
+                
+                best_match = best_conn_pattern.search(line)
+                if best_match:
+                    ip, port, delay = best_match.groups()
+                    
+                    if validity_started:
+                        refresh_count = update_ip_refresh_count(ip, delay)
+                        
+                        # 普通刷新全部在同一行更新，只有关键事件才换行
+                        current_delay = ip_delays.get(ip, '---')
+                        refresh_line = f"[IP刷新] {ip} | 延迟: {current_delay}ms | 刷新次数: {refresh_count}"
+                        
+                        # 同一行更新
+                        gui_print_refresh(refresh_line)
+                        last_refresh_line = refresh_line
+                        
+                        if ip != current_ip:
+                            old_ip = current_ip
+                            current_ip = ip
+                            # 初始 best/refresh 更新不计入“自动切换频繁”统计
+                        
+                        update_result = update_subscription_if_needed()
+                        if update_result[0]:
+                            new_sub_ip = update_result[1]
+                            switched, old_sub_ip, err = commit_subscription_update(new_sub_ip, cli_mode=False)
+                            gui_print(f"")
+                            if switched:
+                                gui_print(f"[订阅文件] 已更新为当前IP: {new_sub_ip}")
+                                if old_sub_ip:
+                                    old_count = ip_refresh_counts.get(old_sub_ip, 0)
+                                    new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                    gui_print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {new_sub_ip}({new_count}次)")
+                                else:
+                                    new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                    new_delay = ip_delays.get(new_sub_ip, '---')
+                                    gui_print(f"[订阅更新] ✓ 首次订阅IP: {new_sub_ip} | 延迟 {new_delay}ms | 刷新次数 {new_count}")
+                            else:
+                                gui_print(f"[订阅更新] × 写入订阅文件失败，保持原订阅IP: {old_sub_ip or '---'} | 错误: {err}")
+                        last_best_ip = ip
+                    continue
+                
+                valid_match = valid_ip_pattern.search(line)
+                if valid_match and not validity_started:
+                    ip, location, delay = valid_match.groups()
+                    delay_int = int(delay)
+                    now_time = datetime.now().strftime("%H:%M:%S")
+                    
+                    if location not in location_stats:
+                        location_stats[location] = {'count': 0, 'min_delay': 9999, 'max_delay': 0, 'ips': []}
+                    location_stats[location]['count'] += 1
+                    location_stats[location]['min_delay'] = min(location_stats[location]['min_delay'], delay_int)
+                    location_stats[location]['max_delay'] = max(location_stats[location]['max_delay'], delay_int)
+                    
+                    entry = {'ip': ip, 'location': location, 'delay': delay_int, 'time': now_time}
+                    
+                    if ip not in [e['ip'] for e in captured_data]:
+                        captured_data.append(entry)
+                        captured_ips.append(ip)
+                    continue
+                        
+        except Exception as e:
+            gui_print(f"[错误] cfnat 运行异常: {e}")
+        finally:
+            if cfnat_proc:
+                cfnat_proc.terminate()
+                cfnat_proc = None
+        
+        if not running:
+            break
+        
+        gui_print(f"")
+        gui_print(f"[重启] cfnat worker 重新启动...")
+
+
+class CfnatGUI:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title(f"cfnat 本地订阅生成器 {APP_VERSION}")
+        self.root.geometry("750x600")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.settings = load_settings()
+        
+        load_location_stats()
+        self.create_widgets()
+        self.apply_saved_settings()
+        self.update_defaults()
+        
+    def create_widgets(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        info_frame = ttk.LabelFrame(self.root, text="智能配置提示", padding="10")
+        info_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        top_info_frame = ttk.Frame(info_frame)
+        top_info_frame.pack(fill=tk.X, pady=2)
+        self.rush_hour_label = ttk.Label(top_info_frame, text="")
+        self.rush_hour_label.pack(side=tk.LEFT, padx=5)
+        self.suggested_delay_label = ttk.Label(top_info_frame, text="")
+        self.suggested_delay_label.pack(side=tk.LEFT, padx=5)
+        self.suggested_colo_label = ttk.Label(top_info_frame, text="")
+        self.suggested_colo_label.pack(side=tk.LEFT, padx=5)
+        
+        self.stats_label = ttk.Label(info_frame, text="")
+        self.stats_label.pack(anchor="w", pady=2)
+        
+        config_frame = ttk.LabelFrame(self.root, text="扫描配置", padding="10")
+        config_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        colo_delay_frame = ttk.Frame(config_frame)
+        colo_delay_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(colo_delay_frame, text="机房代码:").pack(side=tk.LEFT)
+        self.colo_var = tk.StringVar(value=DEFAULT_CONFIG['colo'])
+        self.colo_combobox = ttk.Combobox(colo_delay_frame, textvariable=self.colo_var, width=10, state='readonly')
+        self.colo_combobox.pack(side=tk.LEFT, padx=5)
+        ttk.Label(colo_delay_frame, text="延迟阈值(ms):").pack(side=tk.LEFT, padx=5)
+        self.delay_var = tk.StringVar(value=str(DEFAULT_CONFIG['delay']))
+        self.delay_entry = ttk.Entry(colo_delay_frame, textvariable=self.delay_var, width=10)
+        self.delay_entry.pack(side=tk.LEFT, padx=5)
+        
+        other_frame = ttk.Frame(config_frame)
+        other_frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Label(other_frame, text="并发任务:").pack(side=tk.LEFT)
+        self.task_var = tk.StringVar(value="100")
+        self.task_entry = ttk.Entry(other_frame, textvariable=self.task_var, width=6)
+        self.task_entry.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(other_frame, text="负载数:").pack(side=tk.LEFT, padx=5)
+        self.num_var = tk.StringVar(value="3")
+        self.num_entry = ttk.Entry(other_frame, textvariable=self.num_var, width=6)
+        self.num_entry.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(other_frame, text="提取IP数:").pack(side=tk.LEFT, padx=5)
+        self.ipnum_var = tk.StringVar(value="20")
+        self.ipnum_entry = ttk.Entry(other_frame, textvariable=self.ipnum_var, width=6)
+        self.ipnum_entry.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(other_frame, text="服务端口:").pack(side=tk.LEFT, padx=5)
+        self.port_var = tk.StringVar(value="8888")
+        self.port_entry = ttk.Entry(other_frame, textvariable=self.port_var, width=6)
+        self.port_entry.pack(side=tk.LEFT, padx=2)
+        
+        manual_ip_frame = ttk.LabelFrame(self.root, text="手动输入IP（可选）", padding="10")
+        manual_ip_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ip_input_frame = ttk.Frame(manual_ip_frame)
+        ip_input_frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Label(ip_input_frame, text="IP地址:").pack(side=tk.LEFT)
+        self.manual_ip_var = tk.StringVar()
+        self.manual_ip_entry = ttk.Entry(ip_input_frame, textvariable=self.manual_ip_var, width=20)
+        self.manual_ip_entry.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(ip_input_frame, text="支持IPv4/IPv6，建议IPv4（样本量大）", foreground='gray').pack(side=tk.LEFT, padx=5)
+        
+        btn_frame = ttk.Frame(self.root, padding="5")
+        btn_frame.pack(fill=tk.X)
+        
+        self.start_btn = ttk.Button(btn_frame, text="启动扫描", command=self.start_cfnat)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.manual_ip_btn = ttk.Button(btn_frame, text="手动IP启动", command=self.start_with_manual_ip)
+        self.manual_ip_btn.pack(side=tk.LEFT, padx=5)
+
+        self.subscription_speedtest_btn = ttk.Button(btn_frame, text="测速当前订阅", command=self.start_subscription_speedtest)
+        self.subscription_speedtest_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.restart_btn = ttk.Button(btn_frame, text="重启扫描", command=self.restart_cfnat, state=tk.DISABLED)
+        self.restart_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(btn_frame, text="停止扫描", command=self.stop_cfnat, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        # 日志保存选项
+        self.save_log_var = tk.BooleanVar(value=save_cfnat_log)
+        self.save_log_check = ttk.Checkbutton(btn_frame, text="保存cfnat日志", variable=self.save_log_var, command=self.toggle_save_log)
+        self.save_log_check.pack(side=tk.LEFT, padx=15)
+        
+        self.log_text = scrolledtext.ScrolledText(self.root, state='disabled', font=('Consolas', 11))
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        bottom_frame = ttk.Frame(self.root, padding="5")
+        bottom_frame.pack(fill=tk.X)
+        
+        ttk.Label(bottom_frame, text="提示: 关闭窗口终止运行").pack(side=tk.LEFT)
+
+    def apply_saved_settings(self):
+        """恢复上次保存的界面设置。"""
+        self.manual_ip_var.set(self.settings.get('manual_ip', '').strip())
+
+    def persist_ui_settings(self):
+        """保存当前界面设置，避免关闭后手动IP被清空。"""
+        settings = load_settings()
+        settings['save_cfnat_log'] = self.save_log_var.get()
+        settings['manual_ip'] = self.manual_ip_var.get().strip()
+        save_settings(settings)
+    
+    def toggle_save_log(self):
+        """切换日志保存状态"""
+        global save_cfnat_log
+        
+        save_cfnat_log = self.save_log_var.get()
+        
+        if save_cfnat_log:
+            log_file = init_cfnat_log()
+            gui_print(f"[日志] 已启用cfnat日志保存: {log_file}")
+        else:
+            gui_print(f"[日志] 已关闭cfnat日志保存")
+    
+    def update_defaults(self):
+        rush_hour = is_rush_hour()
+        suggested_delay = DEFAULT_CONFIG['delay_rush'] if rush_hour else DEFAULT_CONFIG['delay']
+        
+        best_colos = get_best_colos_from_stats()
+        suggested_colo = DEFAULT_CONFIG['colo']
+        if best_colos:
+            suggested_colo = best_colos[0]['code']
+            if suggested_colo == '---':
+                suggested_colo = DEFAULT_CONFIG['colo']
+        
+        self.rush_hour_label.config(text=f"时间检测: {'晚高峰 (20:00-01:00)' if rush_hour else '非晚高峰'}")
+        self.suggested_delay_label.config(text=f"建议延迟: {suggested_delay}ms")
+        self.suggested_colo_label.config(text=f"建议机房: {suggested_colo}")
+        
+        if best_colos:
+            stats_text = "上次扫描 - 最多IP机房: "
+            for colo in best_colos[:3]:
+                stats_text += f"{colo['code']}({colo['avg_delay']}ms,{colo['count']}个) "
+            self.stats_label.config(text=stats_text)
+        else:
+            self.stats_label.config(text="暂无上次扫描数据")
+        
+        colo_options = []
+        if best_colos:
+            for colo in best_colos:
+                colo_options.append(colo['code'])
+        colo_options.append(DEFAULT_CONFIG['colo'])
+        colo_options.append('NRT')
+        colo_options.append('LAX')
+        colo_options.append('SJC')
+        colo_options.append('SEA')
+        colo_options = list(dict.fromkeys(colo_options))
+        self.colo_combobox['values'] = colo_options
+        
+        self.colo_var.set(suggested_colo)
+        self.delay_var.set(str(suggested_delay))
+        
+    def start_cfnat(self, clear_log=True):
+        global running, current_template, current_args, subscription_speedtest_running
+        
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        nodes_path = os.path.join(script_dir, NODES_FILE)
+        
+        if not os.path.exists(nodes_path):
+            messagebox.showerror("错误", f"未找到节点模版: {NODES_FILE}\n请创建节点模版文件")
+            return
+        
+        current_template = nodes_path
+        
+        try:
+            colo = self.colo_var.get().upper()
+            delay = int(self.delay_var.get())
+            task = int(self.task_var.get())
+            num = int(self.num_var.get())
+            ipnum = int(self.ipnum_var.get())
+            port = int(self.port_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的数字")
+            return
+        
+        if clear_log:
+            self.log_text.configure(state='normal')
+            self.log_text.delete(1.0, tk.END)
+            self.log_text.configure(state='disabled')
+        
+            gui_print(f"{'='*60}")
+            gui_print(f"  cfnat 本地订阅生成器 {APP_VERSION}")
+            gui_print(f"{'='*60}")
+
+        if subscription_speedtest_running:
+            messagebox.showwarning("冲突提示", "订阅测速进行中，请等待结束后再启动扫描")
+            gui_print("[冲突避免] 订阅测速进行中，已阻止扫描启动")
+            return
+        
+        kill_existing_cfnat()
+        
+        running = True
+        self.start_btn.configure(state=tk.DISABLED)
+        self.manual_ip_btn.configure(state=tk.DISABLED)
+        self.restart_btn.configure(state=tk.NORMAL)
+        self.stop_btn.configure(state=tk.NORMAL)
+        
+        gui_print(f"[启动参数] 机房={colo} 延迟={delay}ms IP数={ipnum}")
+        gui_print(f"[节点模版] {NODES_FILE}")
+        
+        class Args:
+            pass
+        args = Args()
+        args.colo = colo
+        args.delay = delay
+        args.task = task
+        args.num = num
+        args.ipnum = ipnum
+        args.port = port
+        current_args = args
+        
+        if not ensure_subscription_service_running(port):
+            running = False
+            self.start_btn.configure(state=tk.NORMAL)
+            self.manual_ip_btn.configure(state=tk.NORMAL)
+            self.restart_btn.configure(state=tk.DISABLED)
+            self.stop_btn.configure(state=tk.DISABLED)
+            return
+        sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
+        if os.path.exists(sub_path):
+            try:
+                with open(sub_path, 'r', encoding='utf-8') as f:
+                    cached_content = f.read().strip()
+                    if cached_content:
+                        gui_print(f"[订阅文件] 使用缓存内容: {SUBSCRIPTION_FILE}")
+            except:
+                pass
+        
+        threading.Thread(target=cfnat_worker, args=(args,), daemon=True).start()
+    
+    def start_with_manual_ip(self):
+        global running, current_template, current_ip, subscription_ip, subscription_locked, captured_ips, captured_data, subscription_speedtest_running
+        
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        nodes_path = os.path.join(script_dir, NODES_FILE)
+        
+        if not os.path.exists(nodes_path):
+            messagebox.showerror("错误", f"未找到节点模版: {NODES_FILE}\n请创建节点模版文件")
+            return
+        
+        current_template = nodes_path
+        
+        manual_ip_str = self.manual_ip_var.get().strip()
+        if not manual_ip_str:
+            messagebox.showerror("错误", "请输入IP地址")
+            return
+        
+        is_valid, ip_type, error_msg = validate_single_ip(manual_ip_str)
+        
+        if not is_valid:
+            messagebox.showerror("IP验证失败", error_msg)
+            return
+
+        self.manual_ip_var.set(manual_ip_str)
+        self.persist_ui_settings()
+        
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的端口号")
+            return
+        
+        self.log_text.configure(state='normal')
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.configure(state='disabled')
+        
+        gui_print(f"{'='*60}")
+        gui_print(f"  cfnat 本地订阅生成器 {APP_VERSION} - 手动IP模式")
+        gui_print(f"{'='*60}")
+
+        if subscription_speedtest_running:
+            messagebox.showwarning("冲突提示", "订阅测速进行中，请等待结束后再启动")
+            gui_print("[冲突避免] 订阅测速进行中，已阻止手动IP启动")
+            return
+        
+        kill_existing_cfnat()
+        
+        running = True
+        self.start_btn.configure(state=tk.DISABLED)
+        self.manual_ip_btn.configure(state=tk.DISABLED)
+        self.restart_btn.configure(state=tk.DISABLED)
+        self.stop_btn.configure(state=tk.NORMAL)
+        
+        gui_print(f"[手动IP模式] 已输入IP: {manual_ip_str} ({ip_type})")
+        gui_print(f"[节点模版] {NODES_FILE}")
+        
+        captured_ips = [manual_ip_str]
+        captured_data = []
+        now_time = datetime.now().strftime("%H:%M:%S")
+        captured_data.append({'ip': manual_ip_str, 'location': '手动输入', 'delay': 0, 'time': now_time})
+        
+        current_ip = manual_ip_str
+        subscription_ip = manual_ip_str
+        subscription_locked = True
+        
+        gui_print(f"[订阅IP] 已设置为: {subscription_ip}")
+        
+        if not ensure_subscription_service_running(port):
+            running = False
+            self.start_btn.configure(state=tk.NORMAL)
+            self.manual_ip_btn.configure(state=tk.NORMAL)
+            self.restart_btn.configure(state=tk.DISABLED)
+            self.stop_btn.configure(state=tk.DISABLED)
+            return
+        
+        generate_subscription([subscription_ip])
+        
+        gui_print(f"")
+        gui_print(f"{'='*60}")
+        gui_print(f"[订阅服务] 已启动")
+        gui_print(f"{'='*60}")
+        local_ip = get_local_ip()
+        gui_print(f"  本地访问:   http://127.0.0.1:{port}{SUB_PATH}")
+        gui_print(f"  局域网访问: http://{local_ip}:{port}{SUB_PATH}")
+        gui_print(f"{'='*60}")
+        gui_print(f"[提示] 将上述地址复制到代理客户端的订阅地址栏即可使用")
+        gui_print(f"[提示] 手动IP模式不会自动优选，如需更换IP请重新输入")
+        gui_print(f"{'='*60}")
+        gui_print(f"")
+        
+        gui_print(f"[状态] 订阅服务运行中，关闭窗口可停止服务...")
+    
+    def start_subscription_speedtest(self):
+        global subscription_speedtest_running
+
+        if subscription_speedtest_running:
+            gui_print("[订阅测速] 正在测速中，请等待当前任务完成")
+            return
+
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "请输入有效的端口号")
+            return
+
+        if not ensure_subscription_service_running(port):
+            return
+
+        target, err = get_subscription_speedtest_target()
+        if err:
+            messagebox.showwarning("订阅测速", err)
+            return
+
+        subscription_speedtest_running = True
+        self.subscription_speedtest_btn.configure(state=tk.DISABLED)
+        threading.Thread(target=self.subscription_speedtest_worker, args=(target,), daemon=True).start()
+
+    def subscription_speedtest_worker(self, target):
+        global subscription_speedtest_running
+
+        try:
+            gui_print("")
+            gui_print(f"[订阅测速] 开始测速: {target['ip']}:{target['port']}")
+            gui_print("[订阅测速] 已忽略系统代理，直连目标IP，测速文件 10MB")
+            speed = run_subscription_speedtest(target['ip'], target['port'], target['scheme'])
+            gui_print(f"[订阅测速] 结果: {speed} | IP {target['ip']} | 端口 {target['port']}")
+        except Exception as e:
+            gui_print(f"[订阅测速] 失败: {e}")
+        finally:
+            subscription_speedtest_running = False
+            self.root.after(0, lambda: self.subscription_speedtest_btn.configure(state=tk.NORMAL))
+
+    def stop_cfnat(self):
+        global running, cfnat_proc
+        running = False
+        if cfnat_proc:
+            try:
+                cfnat_proc.terminate()
+                gui_print("[操作] cfnat 进程已停止")
+            except:
+                pass
+        self.start_btn.configure(state=tk.NORMAL)
+        self.manual_ip_btn.configure(state=tk.NORMAL)
+        self.restart_btn.configure(state=tk.DISABLED)
+        self.stop_btn.configure(state=tk.DISABLED)
+    
+    def restart_cfnat(self):
+        global current_args
+        if current_args:
+            self.stop_cfnat()
+            time.sleep(1)
+            gui_print("\n[重启] 重新启动扫描...")
+            self.start_cfnat(clear_log=False)
+        
+    def on_closing(self):
+        global cfnat_proc, http_server, running
+        result = messagebox.askyesnocancel("退出", "是否同时关闭 cfnat？\n\n是 = 关闭窗口、cfnat和订阅服务（推荐）\n否 = 仅关闭窗口和订阅服务，cfnat继续后台运行\n取消 = 取消操作")
+        
+        if result is None:
+            return
+        elif result:
+            running = False
+            if cfnat_proc:
+                try:
+                    cfnat_proc.terminate()
+                    print("[退出] cfnat 进程已关闭")
+                except:
+                    pass
+            if http_server:
+                try:
+                    http_server.shutdown()
+                    print("[退出] HTTP 服务器已关闭")
+                except:
+                    pass
+        else:
+            if http_server:
+                try:
+                    http_server.shutdown()
+                    print("[退出] HTTP 服务器已关闭")
+                except:
+                    pass
+        
+        self.persist_ui_settings()
+        self.root.destroy()
+
+
+def cli_mode():
+    global running, current_template
+    
+    print(f"\n{'='*60}")
+    print("cfnat 本地订阅生成器 v26.6.2 (CLI模式)")
+    print(f"{'='*60}")
+    
+    parser = argparse.ArgumentParser(description='cfnat 本地订阅生成器 v26.6.2')
+    parser.add_argument('--colo', default=DEFAULT_CONFIG['colo'], help=f"机房代码 (默认: {DEFAULT_CONFIG['colo']})")
+    parser.add_argument('--delay', type=int, default=DEFAULT_CONFIG['delay'], help=f"延迟阈值ms (默认: {DEFAULT_CONFIG['delay']})")
+    parser.add_argument('--task', type=int, default=100, help='并发任务数 (默认: 100)')
+    parser.add_argument('--num', type=int, default=3, help='每个IP的端口数 (默认: 3)')
+    parser.add_argument('--ipnum', type=int, default=20, help='IP数量 (默认: 20)')
+    parser.add_argument('--port', type=int, default=8888, help='订阅服务端口 (默认: 8888)')
+    parser.add_argument('--debug', '-d', action='store_true', help='调试模式，显示详细输出')
+    parser.add_argument('--sub-only', action='store_true', help='仅启动订阅服务')
+    parser.add_argument('--ips', type=str, help='手动指定IP列表(逗号分隔)')
+    parser.add_argument('--template', type=str, help='模版文件路径')
+    args = parser.parse_args()
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    nodes_path = os.path.join(script_dir, NODES_FILE)
+    
+    if args.template:
+        current_template = args.template
+    else:
+        current_template = nodes_path
+    
+    if not os.path.exists(current_template):
+        print(f"[错误] 未找到节点模版: {current_template}")
+        print(f"[提示] 请创建节点模版文件")
+        return
+    
+    if args.ips:
+        ip_list = [ip.strip() for ip in args.ips.split(',')]
+        for ip in ip_list:
+            if ip and ip not in captured_ips:
+                now_time = datetime.now().strftime("%H:%M:%S")
+                captured_data.append({'ip': ip, 'port': '443', 'time': now_time})
+                captured_ips.append(ip)
+        print(f"[手动IP] 已加载 {len(captured_ips)} 个 IP")
+    
+    kill_existing_cfnat()
+    
+    print(f"[启动参数] 机房={args.colo} 延迟={args.delay}ms IP数={args.ipnum}")
+    print(f"[节点模版] {os.path.basename(current_template)}")
+    
+    port = args.port
+    http_thread = threading.Thread(target=start_http_server_cli, args=(port,), daemon=True)
+    http_thread.start()
+    
+    time.sleep(0.5)
+    sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
+    if os.path.exists(sub_path):
+        try:
+            with open(sub_path, 'r', encoding='utf-8') as f:
+                cached_content = f.read().strip()
+                if cached_content:
+                    print(f"[订阅文件] 使用缓存内容: {SUBSCRIPTION_FILE}")
+        except:
+            pass
+    
+    if args.sub_only:
+        print("[模式] 仅订阅服务，按 Ctrl+C 退出")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n退出...")
+    else:
+        print(f"[模式] 完整服务，按 Ctrl+C 退出\n")
+        try:
+            cfnat_worker_cli(args)
+        except KeyboardInterrupt:
+            print("\n退出...")
+
+
+def start_http_server_cli(port):
+    global http_server
+    try:
+        http_server = socketserver.TCPServer(('0.0.0.0', port), SubHandler)
+        http_server.allow_reuse_address = True
+        local_ip = get_local_ip()
+        print(f"\n{'='*60}")
+        print(f"[订阅服务] 已启动")
+        print(f"{'='*60}")
+        print(f"  本地访问:   http://127.0.0.1:{port}{SUB_PATH}")
+        print(f"  局域网访问: http://{local_ip}:{port}{SUB_PATH}")
+        print(f"{'='*60}")
+        print(f"[提示] 将上述地址复制到代理客户端的订阅地址栏即可使用")
+        print(f"[提示] 订阅内容会随 IP 优选自动更新，无需手动刷新")
+        print(f"{'='*60}\n")
+        http_server.serve_forever()
+    except Exception as e:
+        print(f"[错误] 启动HTTP服务失败: {e}")
+
+
+def cfnat_worker_cli(args):
+    global captured_ips, captured_data, cfnat_proc, running, location_stats, auto_switch_start_time, auto_switch_history
+    global scan_start_time, current_ip, current_args, ip_refresh_counts, subscription_ip, last_refresh_ip, ip_exhausted_history
+    global ip_delays, last_log_time, valid_ip_count, subscription_locked
+    
+    current_args = args
+    
+    while running:
+        location_stats = {}
+        captured_ips = []
+        captured_data = []
+        ip_refresh_counts = {}
+        ip_delays = {}
+        # 不再重置 subscription_ip，保留上一轮的历史订阅IP
+        # 新扫描开始时解锁订阅，允许新IP在达到10次后切换
+        subscription_locked = False
+        last_refresh_ip = None
+        ip_exhausted_history = []
+        last_log_time = 0
+        valid_ip_count = 0
+        
+        cfnat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CFNAT_BIN)
+        if not os.path.exists(cfnat_path):
+            print(f"[错误] 找不到 cfnat 程序: {cfnat_path}")
+            return
+        
+        use_args = current_args if current_args else args
+        cmd = [
+            cfnat_path,
+            '-ips', '4',
+            '-addr', '127.0.0.1:1234',
+            '-colo', use_args.colo,
+            '-random=true',
+            '-delay', str(use_args.delay),
+            '-task', str(use_args.task),
+            '-num', str(use_args.num),
+            '-ipnum', str(use_args.ipnum),
+            '-port', '443',
+            '-tls=true'
+        ]
+        
+        print(f"[cfnat] 启动参数: {' '.join(cmd)}")
+        print(f"[cfnat] 正在扫描优选 IP，请耐心等待...\n")
+        
+        valid_ip_pattern = re.compile(r'发现有效IP\s+(\d{1,3}(?:\.\d{1,3}){3})\s+位置信息\s+(.+?)\s+延迟\s+(\d+)\s+毫秒')
+        best_conn_pattern = re.compile(r'选择最佳连接[:：]\s*地址[:：]\s*(\d{1,3}(?:\.\d{1,3}){3}):(\d+)\s*延迟[:：]\s*(\d+)\s*ms')
+        progress_pattern = re.compile(r'已完成:\s*(\d+)\s+总数:\s*(\d+)')
+        listen_pattern = re.compile(r'正在监听\s+(\S+)')
+        validity_start_pattern = re.compile(r'开始状态检查')
+        valid_conn_pattern = re.compile(r'符合要求的连接[:：]?')
+        no_valid_pattern = re.compile(r'未找到符合延迟要求的连接')
+        switch_ip_pattern = re.compile(r'切换到新的有效 IP[:：]\s*(\d{1,3}(?:\.\d{1,3}){3})')
+        all_ip_exhausted_pattern = re.compile(r'所有 IP 都已检查过|所有 IP 都已用尽')
+        scan_complete_pattern = re.compile(r'成功提取\s+(\d+)\s+个有效IP')
+        rescan_pattern = re.compile(r'主函数将退出当前循环')
+        fail_check_pattern = re.compile(r'状态检查失败|连续两次状态检查失败')
+        
+        validity_started = False
+        last_best_ip = None
+        last_progress_pct = -1
+        last_refresh_line = ""
+        scan_start_time = time.time()
+        ip_exhausted_logged = False  # 本轮扫描是否已记录过IP耗尽
+        
+        try:
+            creationflags = 0
+            if sys.platform == 'win32':
+                creationflags = 0x08000000
+            
+            cfnat_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=creationflags
+            )
+            
+            for line in iter(cfnat_proc.stdout.readline, ''):
+                if not running:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                
+                listen_match = listen_pattern.search(line)
+                if listen_match:
+                    continue
+                
+                if validity_start_pattern.search(line):
+                    if not validity_started:
+                        validity_started = True
+                        ip_exhausted_logged = False  # 进入优选模式时重置IP耗尽记录标志
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        print(f"{'='*60}")
+                        print(f"[优选模式] 扫描完成，进入IP优选阶段")
+                        print(f"{'='*60}")
+                        if location_stats:
+                            save_location_stats(location_stats)
+                            print(f"\n[扫描统计] 各机场 IP 分布 (≥10个):")
+                            print(f"{'-'*60}")
+                            print(f"{'机场名称':<16} {'代码':<8} {'数量':>6} {'平均延迟':>10}")
+                            print(f"{'-'*60}")
+                            sorted_stats = sorted(location_stats.items(), key=lambda x: x[1]['count'], reverse=True)
+                            total = 0
+                            other_count = 0
+                            for loc, stats in sorted_stats:
+                                count = stats['count']
+                                if count < 10:
+                                    other_count += count
+                                    continue
+                                code = get_location_code(loc)
+                                avg_delay = (stats['min_delay'] + stats['max_delay']) // 2
+                                print(f"{loc:<16} {code:<8} {count:>6} {avg_delay:>9}ms")
+                                total += count
+                            if other_count > 0:
+                                print(f"{'其他':<16} {'':<8} {other_count:>6}")
+                            print(f"{'-'*60}")
+                            print(f"{'总计':<16} {'':<8} {total + other_count:>6}")
+                            print(f"{'-'*60}\n")
+                        
+                        print(f"[扫描发现] 共发现 {valid_ip_count} 个有效IP")
+                        print(f"[订阅地址] http://127.0.0.1:{args.port}/sub")
+                        print(f"[等待优选] 等待cfnat选出最佳IP...")
+                        
+                        if captured_ips:
+                            current_ip = captured_ips[0]
+                            auto_switch_history = []
+                            auto_switch_start_time = 0
+                            last_best_ip = None
+                    continue
+                
+                progress_match = progress_pattern.search(line)
+                if progress_match and not validity_started:
+                    done, total = progress_match.groups()
+                    done_int = int(done)
+                    total_int = int(total)
+                    pct = float(done_int) / float(total_int) * 100 if total_int > 0 else 0
+                    pct_int = int(pct)
+                    if pct_int != last_progress_pct and pct_int % 5 == 0:
+                        last_progress_pct = pct_int
+                        ip_count = len(captured_ips)
+                        elapsed = time.time() - scan_start_time
+                        speed = done_int / elapsed if elapsed > 0 else 0
+                        remaining = (total_int - done_int) / speed if speed > 0 else 0
+                        print(f"\r[扫描] {pct_int}% | {ip_count}个IP | {int(speed)}/秒 | 剩余{int(remaining)}秒", end='', flush=True)
+                    continue
+                
+                if valid_conn_pattern.search(line):
+                    continue
+                
+                if no_valid_pattern.search(line):
+                    if not validity_started:
+                        print(f"[警告] 未找到符合延迟要求的连接，等待下一次检测...")
+                    continue
+                
+                if fail_check_pattern.search(line):
+                    if '连续两次' in line:
+                        print(f"[状态] 连续失败，切换IP...")
+                    continue
+                
+                if all_ip_exhausted_pattern.search(line):
+                    # 防止同一轮扫描重复记录IP耗尽
+                    if not ip_exhausted_logged:
+                        ip_exhausted_logged = True
+                        print(f"\n[IP耗尽] 将重新扫描...")
+                        check_result = check_ip_exhausted_cli()
+                        if check_result == 'retry':
+                            continue
+                        elif check_result:
+                            running = False
+                            break
+                    validity_started = False
+                    continue
+                
+                scan_complete_match = scan_complete_pattern.search(line)
+                if scan_complete_match:
+                    count = scan_complete_match.group(1)
+                    valid_ip_count = int(count)
+                    print(f"\n[扫描完成] 找到 {count} 个有效IP")
+                    continue
+                
+                if rescan_pattern.search(line):
+                    print(f"\n[重新扫描] 开始...")
+                    validity_started = False
+                    continue
+                
+                switch_match = switch_ip_pattern.search(line)
+                if switch_match:
+                    new_ip = switch_match.group(1)
+                    
+                    if new_ip != current_ip:
+                        old_ip = current_ip
+                        current_ip = new_ip
+                        if check_ip_switch_too_frequent_cli(new_ip):
+                            running = False
+                            break
+                        
+                        refresh_count = update_ip_refresh_count(new_ip)
+                        if should_show_log():
+                            old_count = ip_refresh_counts.get(old_ip, 0) if old_ip else 0
+                            current_delay = ip_delays.get(new_ip, '---')
+                            refresh_line = f"\r[IP切换] {old_ip or '---'} → {new_ip} | 延迟: {current_delay}ms | 刷新次数: {refresh_count}"
+                            print(refresh_line, end='', flush=True)
+                            last_refresh_line = refresh_line
+                        
+                        # 显示当前cfnat使用的IP信息和订阅状态
+                        if current_ip:
+                            current_refresh_count = ip_refresh_counts.get(current_ip, 0)
+                            current_delay_val = ip_delays.get(current_ip, '---')
+                            print(f"")
+                            print(f"[当前使用] IP: {current_ip} | 延迟 {current_delay_val}ms | 刷新次数 {current_refresh_count}")
+                            # 显示当前订阅IP（可能与current_ip不同）
+                            if subscription_ip:
+                                sub_delay = ip_delays.get(subscription_ip, '---')
+                                sub_count = ip_refresh_counts.get(subscription_ip, 0)
+                                if subscription_ip == current_ip:
+                                    # 当前IP就是订阅IP
+                                    if sub_count >= SUBSCRIPTION_LOCK_THRESHOLD:
+                                        print(f"[订阅IP] {subscription_ip} | 延迟 {sub_delay}ms | 刷新 {sub_count}次 | 当前最优")
+                                    else:
+                                        remaining = SUBSCRIPTION_LOCK_THRESHOLD - sub_count
+                                        print(f"[订阅IP] {subscription_ip} | 延迟 {sub_delay}ms | 刷新 {sub_count}次 | 还需{remaining}次稳定")
+                                else:
+                                    # 当前使用IP与订阅IP不同，显示新IP还需多少次才切换
+                                    remaining = SUBSCRIPTION_LOCK_THRESHOLD - current_refresh_count
+                                    if remaining > 0:
+                                        print(f"[候选IP] {current_ip} | 延迟 {current_delay_val}ms | 刷新 {current_refresh_count}次 | 还需{remaining}次可切换订阅")
+                                    else:
+                                        print(f"[候选IP] {current_ip} | 延迟 {current_delay_val}ms | 刷新 {current_refresh_count}次 | 即将切换订阅")
+                                    # 当前订阅IP
+                                    count_str = f"本轮{sub_count}次" if sub_count > 0 else "历史订阅"
+                                    print(f"[订阅IP] {subscription_ip} | 延迟 {sub_delay}ms | {count_str}")
+                            else:
+                                # 首次运行，无历史订阅IP
+                                remaining = SUBSCRIPTION_LOCK_THRESHOLD - current_refresh_count
+                                if remaining > 0:
+                                    print(f"[订阅状态] 等待首次优选（还需{remaining}次刷新）")
+                        
+                        update_result = update_subscription_if_needed()
+                        if update_result[0]:
+                            new_sub_ip = update_result[1]
+                            switched, old_sub_ip, err = commit_subscription_update(new_sub_ip, cli_mode=True)
+                            print(f"")
+                            if switched:
+                                print(f"[订阅文件] 已更新为当前IP: {new_sub_ip}")
+                                if old_sub_ip:
+                                    old_count = ip_refresh_counts.get(old_sub_ip, 0)
+                                    new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                    print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {new_sub_ip}({new_count}次)")
+                                else:
+                                    new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                    new_delay = ip_delays.get(new_sub_ip, '---')
+                                    print(f"[订阅更新] ✓ 首次订阅IP: {new_sub_ip} | 延迟 {new_delay}ms | 刷新次数 {new_count}")
+                            else:
+                                print(f"[订阅更新] × 写入订阅文件失败，保持原订阅IP: {old_sub_ip or '---'} | 错误: {err}")
+                    continue
+                
+                best_match = best_conn_pattern.search(line)
+                if best_match:
+                    ip, port, delay = best_match.groups()
+                    
+                    if validity_started:
+                        refresh_count = update_ip_refresh_count(ip, delay)
+                        
+                        # 普通刷新全部在同一行更新，只有关键事件才换行
+                        current_delay = ip_delays.get(ip, '---')
+                        refresh_line = f"[IP刷新] {ip} | 延迟: {current_delay}ms | 刷新次数: {refresh_count}"
+                        
+                        # 同一行更新
+                        print(f"\r{refresh_line}", end='', flush=True)
+                        
+                        if ip != current_ip:
+                            old_ip = current_ip
+                            current_ip = ip
+                            # 初始 best/refresh 更新不计入“自动切换频繁”统计
+                        
+                        update_result = update_subscription_if_needed()
+                        if update_result[0]:
+                            new_sub_ip = update_result[1]
+                            switched, old_sub_ip, err = commit_subscription_update(new_sub_ip, cli_mode=True)
+                            print(f"")
+                            if switched:
+                                print(f"[订阅文件] 已更新为当前IP: {new_sub_ip}")
+                                if old_sub_ip:
+                                    old_count = ip_refresh_counts.get(old_sub_ip, 0)
+                                    new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                    print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {new_sub_ip}({new_count}次)")
+                                else:
+                                    new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                    new_delay = ip_delays.get(new_sub_ip, '---')
+                                    print(f"[订阅更新] ✓ 首选IP: {new_sub_ip} | 延迟 {new_delay}ms | 刷新次数 {new_count}")
+                            else:
+                                print(f"[订阅更新] × 写入订阅文件失败，保持原订阅IP: {old_sub_ip or '---'} | 错误: {err}")
+                        last_best_ip = ip
+                    continue
+            
+            valid_match = valid_ip_pattern.search(line)
+            if valid_match and not validity_started:
+                ip, location, delay = valid_match.groups()
+                delay_int = int(delay)
+                now_time = datetime.now().strftime("%H:%M:%S")
+                
+                if location not in location_stats:
+                    location_stats[location] = {'count': 0, 'min_delay': 9999, 'max_delay': 0, 'ips': []}
+                location_stats[location]['count'] += 1
+                location_stats[location]['min_delay'] = min(location_stats[location]['min_delay'], delay_int)
+                location_stats[location]['max_delay'] = max(location_stats[location]['max_delay'], delay_int)
+                
+                entry = {'ip': ip, 'location': location, 'delay': delay_int, 'time': now_time}
+                
+                if ip not in [e['ip'] for e in captured_data]:
+                    captured_data.append(entry)
+                    captured_ips.append(ip)
+                continue
+                    
+        except Exception as e:
+            print(f"[错误] cfnat 运行异常: {e}")
+            if not running:
+                break
+        finally:
+            if cfnat_proc:
+                try:
+                    cfnat_proc.wait(timeout=5)
+                except:
+                    cfnat_proc.kill()
+                cfnat_proc = None
+        
+        if not running:
+            break
+        
+        print(f"\n[等待] 2秒后重新启动...\n")
+        time.sleep(2)
+
+
+def check_ip_switch_too_frequent_cli(new_ip):
+    global auto_switch_history, cfnat_proc, running, auto_switch_start_time, downgrade_attempt_count, last_used_colos, current_args
+
+    if is_rush_hour():
+        return False
+
+    current_time = time.time()
+    
+    validity_minutes = 0
+    if auto_switch_start_time > 0:
+        validity_minutes = (current_time - auto_switch_start_time) / 60
+    
+    auto_switch_start_time = current_time
+    auto_switch_history.append({'time': current_time, 'ip': new_ip, 'validity': validity_minutes})
+
+    if len(auto_switch_history) < MAX_SHORT_VALIDITY_COUNT + 1:
+        return False
+
+    recent_switches = auto_switch_history[-(MAX_SHORT_VALIDITY_COUNT + 1):]
+    intervals = []
+    for i in range(1, len(recent_switches)):
+        interval_minutes = (recent_switches[i]['time'] - recent_switches[i-1]['time']) / 60
+        intervals.append(interval_minutes)
+
+    short_interval_count = sum(1 for interval in intervals if interval < MIN_VALIDITY_MINUTES)
+
+    if short_interval_count >= MAX_SHORT_VALIDITY_COUNT:
+        print(f"\n{'!'*60}")
+        print("[严重警告] 检测到 IP 频繁切换！")
+        print(f"{'='*60}")
+        print(f"切换历史详情:")
+        for i, switch in enumerate(recent_switches, 1):
+            dt = datetime.fromtimestamp(switch['time']).strftime('%H:%M:%S')
+            print(f"  {i}. {dt} - IP: {switch['ip']} - 有效期: {switch['validity']:.1f}分钟")
+        print(f"\n切换间隔:")
+        for i, interval in enumerate(intervals, 1):
+            status = "⚠️ 小于10分钟" if interval < MIN_VALIDITY_MINUTES else "✅ 正常"
+            print(f"  第{i}次间隔: {interval:.1f}分钟 - {status}")
+        print(f"{'='*60}")
+        
+        print(f"\n{'!'*60}")
+        print("[严重警告] 检测到 IP 频繁切换！")
+        print("[提示] 请手动检查日志后再判断下一步操作")
+        print(f"{'!'*60}\n")
+        
+        if cfnat_proc:
+            cfnat_proc.terminate()
+            print("[操作] cfnat 进程已关闭。")
+        
+        running = False
+        return True
+
+    return False
+
+
+def generate_subscription_cli(ips=None, sort_by_delay=True, silent=False):
+    template_nodes = load_template()
+    if not template_nodes:
+        return ""
+    
+    use_ips = []
+    
+    if ips:
+        use_ips = ips
+    elif current_ip:
+        use_ips = [current_ip]
+    else:
+        sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
+        if os.path.exists(sub_path):
+            try:
+                with open(sub_path, 'r', encoding='utf-8') as f:
+                    cached_content = f.read().strip()
+                    if cached_content:
+                        if not silent:
+                            print(f"[订阅文件] 使用缓存内容: {SUBSCRIPTION_FILE}")
+                        return cached_content
+            except:
+                pass
+        return base64.b64encode('\n'.join([n['raw'] for n in template_nodes]).encode()).decode()
+    
+    ip_index = 0
+    result_lines = []
+    for node in template_nodes:
+        if node['type'] == 'vless' and node['port'] == 443:
+            new_ip = use_ips[ip_index % len(use_ips)]
+            new_node = replace_node_ip(node, new_ip, ip_index + 1)
+            result_lines.append(build_vless_url(new_node))
+            ip_index += 1
+        elif node['type'] == 'vmess' and int(node['data'].get('port', 0)) == 443:
+            new_ip = use_ips[ip_index % len(use_ips)]
+            new_node = replace_node_ip(node, new_ip, ip_index + 1)
+            result_lines.append(build_vmess_url(new_node))
+            ip_index += 1
+        else:
+            if node['type'] == 'vless':
+                result_lines.append(build_vless_url(node))
+            elif node['type'] == 'vmess':
+                result_lines.append(build_vmess_url(node))
+    
+    result = base64.b64encode('\n'.join(result_lines).encode()).decode()
+    
+    if not silent:
+        try:
+            ok, err = write_subscription_content(result)
+            if not ok:
+                raise err
+            if ips and len(ips) == 1:
+                print(f"[订阅文件] 已更新为当前IP: {ips[0]}")
+            else:
+                print(f"[订阅文件] 已更新: {SUBSCRIPTION_FILE}")
+        except Exception as e:
+            print(f"[错误] 写入订阅文件失败: {e}")
+    
+    return result
+
+
+def main():
+    global subscription_ip, subscription_locked, save_cfnat_log, cfnat_log_file
+    
+    if not check_single_instance():
+        print("[错误] 程序已在运行")
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, "程序已在运行！", "cfnat订阅生成器", 0x40)
+        except:
+            pass
+        return
+    
+    # 加载用户设置
+    settings = load_settings()
+    save_cfnat_log = settings.get('save_cfnat_log', False)
+    if save_cfnat_log:
+        print(f"[设置] 日志保存已启用（上次设置）")
+    
+    load_location_data()
+    
+    # 尝试从缓存文件恢复订阅IP
+    cached_ip = load_subscription_ip_from_cache()
+    if cached_ip:
+        subscription_ip = cached_ip
+        # 不立即锁定，允许新IP在达到10次后切换
+        # 只有在当前IP与订阅IP相同且达到阈值时才锁定
+        print(f"[订阅恢复] 从缓存恢复订阅IP: {cached_ip}（未锁定，等待新IP优选）")
+    
+    # 日志保存开关，启动时初始化日志文件
+    if save_cfnat_log:
+        cfnat_log_file = init_cfnat_log()
+        print(f"[日志] 已启用cfnat日志保存: {cfnat_log_file}")
+    
+    try:
+        if len(sys.argv) > 1:
+            cli_mode()
+        else:
+            global gui_app
+            gui_app = CfnatGUI()
+            gui_app.root.mainloop()
+    finally:
+        cleanup_pid_file()
+        # 保存用户设置
+        settings = load_settings()
+        settings['save_cfnat_log'] = save_cfnat_log
+        if gui_app is not None:
+            try:
+                settings['manual_ip'] = gui_app.manual_ip_var.get().strip()
+            except Exception:
+                pass
+        save_settings(settings)
+
+
+if __name__ == '__main__':
+    main()

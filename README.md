@@ -29,20 +29,20 @@
 
 准备好这些文件：
 
-- `cfnat_sub_gui.pyw`
+- `cfnat_sub_gui_v26.6.2.pyw`
 - `cfdata-cli-win7-experimental.exe`
 - `nodes.txt`
 
 启动方式：
 
 ```text
-双击 cfnat_sub_gui.pyw
+双击 cfnat_sub_gui_v26.6.2.pyw
 ```
 
 或：
 
 ```bash
-python cfnat_sub_gui.pyw
+python cfnat_sub_gui_v26.6.2.pyw
 ```
 
 启动后基本流程是：
@@ -144,7 +144,7 @@ GUI 中提供“测速当前订阅”按钮，用于对当前订阅 IP 做一次
 
 | 文件 | 说明 |
 |------|------|
-| `cfnat_sub_gui.pyw` | GUI 主脚本 |
+| `cfnat_sub_gui_v26.6.2.pyw` | GUI 主脚本 |
 | `cfdata-cli-win7-experimental.exe` | Win7 兼容实验版 CLI |
 | `nodes.txt` | 节点模板文件 |
 | `subscription.txt` | 生成后的订阅文件 |
