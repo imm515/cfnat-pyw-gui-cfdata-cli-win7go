@@ -1,0 +1,18 @@
+# 运行时生成的文件
+cfnat_sub.pid
+settings.json
+
+# 生成的订阅文件
+subscription.txt
+
+# 缓存文件
+location_cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 临时文件
+*.tmp
+*.temp
